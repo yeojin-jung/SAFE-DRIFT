@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+outputs/
+checkpoints/
+wandb/
+data/setting_2_medical/prepared/
+data/setting_3_empathetic/prepared/
+
+*.pt
+*.pth
+*.bin
+*.safetensors

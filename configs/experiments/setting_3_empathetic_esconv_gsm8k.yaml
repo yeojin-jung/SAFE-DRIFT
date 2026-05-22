@@ -1,0 +1,49 @@
+experiment:
+  id: setting_3_empathetic_esconv_gsm8k
+  name: "Setting 3: Empathetic Dialogues / ESConv / GSM8K"
+
+prepare:
+  - command:
+      - python
+      - scripts/data/prepare_empathetic_data.py
+      - --out
+      - data/setting_3_empathetic/prepared
+      - --target-splits
+      - validation,test
+      - --max-target-train
+      - "34"
+      - --max-candidates
+      - "5000"
+      - --max-target-eval
+      - "66"
+      - --max-reference-examples
+      - "258"
+      - --overwrite
+
+data:
+  candidate_file: data/setting_3_empathetic/prepared/candidate_pool.jsonl
+  target_file: data/setting_3_empathetic/prepared/target_all.jsonl
+  ood_eval_file: data/setting_3_empathetic/prepared/reference_eval/gsm8k.jsonl
+  reference_file: data/setting_3_empathetic/prepared/reference_eval/gsm8k.jsonl
+
+model_variants:
+  - name: olmo7b_gradient_equals_ft
+    gradient_model: allenai/OLMo-2-1124-7B
+    finetune_model: allenai/OLMo-2-1124-7B
+    enabled: true
+  - name: olmo7b_to_instruct_transfer
+    gradient_model: allenai/OLMo-2-1124-7B
+    finetune_model: allenai/OLMo-2-1124-7B-Instruct
+    enabled: true
+
+training:
+  train_lora_r: 16
+  train_lora_alpha: 16
+  train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+evaluation:
+  evaluator: esconv
+  ood_evaluator: none
+  reference_evaluator: gsm8k
+  benchmark_evals: ["gsm8k"]
+  benchmark_max_examples: 258

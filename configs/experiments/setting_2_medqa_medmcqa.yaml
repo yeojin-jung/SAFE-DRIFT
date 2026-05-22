@@ -1,0 +1,54 @@
+experiment:
+  id: setting_2_medqa_medmcqa_truthfulqa_bbq
+  name: "Setting 2: MedQA / MedMCQA / TruthfulQA+BBQ"
+
+prepare:
+  - command:
+      - python
+      - scripts/data/prepare_medical_data.py
+      - --out
+      - data/setting_2_medical/prepared
+      - --max-target-train
+      - "256"
+      - --max-candidates
+      - "50000"
+      - --max-reference-per-dataset
+      - "500"
+      - --reference-datasets
+      - truthfulqa,bbq
+      - --overwrite
+
+data:
+  candidate_file: data/setting_2_medical/prepared/candidate_pool.jsonl
+  target_file: data/setting_2_medical/prepared/target_all.jsonl
+  ood_eval_file: data/setting_2_medical/prepared/reference_eval/mcq_ood_eval.jsonl
+  reference_file: data/setting_2_medical/prepared/reference_prompts.jsonl
+
+model_variants:
+  - name: olmo7b_instruct_gradient_equals_ft
+    gradient_model: allenai/OLMo-2-1124-7B-Instruct
+    finetune_model: allenai/OLMo-2-1124-7B-Instruct
+    enabled: true
+  - name: olmo7b_instruct_to_base_transfer
+    gradient_model: allenai/OLMo-2-1124-7B-Instruct
+    finetune_model: allenai/OLMo-2-1124-7B
+    enabled: true
+  - name: olmo7b_instruct_to_qwen_transfer
+    gradient_model: allenai/OLMo-2-1124-7B-Instruct
+    finetune_model: Qwen/Qwen2.5-7B
+    enabled: false
+  - name: olmo7b_instruct_to_mistral_transfer
+    gradient_model: allenai/OLMo-2-1124-7B-Instruct
+    finetune_model: mistralai/Mistral-7B-v0.3
+    enabled: false
+
+training:
+  train_lora_r: 16
+  train_lora_alpha: 32
+  train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+evaluation:
+  evaluator: medqa
+  ood_evaluator: medqa
+  reference_evaluator: loss
+  benchmark_evals: []

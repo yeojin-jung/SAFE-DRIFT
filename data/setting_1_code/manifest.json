@@ -1,0 +1,9 @@
+{
+  "seed": 42,
+  "candidate_description": "CodeAlpaca candidate pool.",
+  "target_description": "Original HumanEval tasks stored as one JSONL file. Runtime train/validation/evaluation splits are produced by the sweep runner.",
+  "codealpaca_candidate_total": 20016,
+  "humaneval_total": 164,
+  "candidate_file": "data/setting_1_code/codealpaca.jsonl",
+  "humaneval_file": "data/setting_1_code/humaneval.jsonl"
+}

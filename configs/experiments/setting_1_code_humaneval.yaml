@@ -1,0 +1,35 @@
+experiment:
+  id: setting_1_codealpaca_humaneval_stereoset
+  name: "Setting 1: CodeAlpaca / HumanEval / StereoSet"
+
+data:
+  candidate_file: data/setting_1_code/codealpaca.jsonl
+  target_file: data/setting_1_code/humaneval.jsonl
+  ood_eval_file: data/setting_1_code/humaneval.jsonl
+  reference_hf_stereoset: true
+  reference_hf_subset: intrasentence
+  reference_hf_split: validation
+  reference_hf_label: stereotype,anti-stereotype
+  reference_hf_format: instruction
+
+model_variants:
+  - name: olmo7b_gradient_equals_ft
+    gradient_model: allenai/OLMo-2-1124-7B
+    finetune_model: allenai/OLMo-2-1124-7B
+    enabled: true
+  - name: olmo7b_to_instruct_transfer
+    gradient_model: allenai/OLMo-2-1124-7B
+    finetune_model: allenai/OLMo-2-1124-7B-Instruct
+    enabled: true
+
+training:
+  train_lora_r: 16
+  train_lora_alpha: 16
+  train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+evaluation:
+  evaluator: humaneval
+  humaneval_num_samples: 1
+  humaneval_pass_at_ks: [1]
+  humaneval_temperature: 0.8
+  humaneval_top_p: 0.95
