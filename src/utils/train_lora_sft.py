@@ -897,17 +897,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--evaluator",
         default="none",
-        choices=["none", "medqa", "mmlu", "gsm8k", "esconv", "humaneval", "bias_disentangle"],
+        choices=["none", "medqa", "mmlu", "gsm8k", "esconv", "humaneval", "ifeval", "bias_disentangle"],
     )
     parser.add_argument(
         "--ood-evaluator",
         default=None,
-        choices=["none", "medqa", "mmlu", "gsm8k", "esconv", "humaneval", "bias_disentangle"],
+        choices=["none", "medqa", "mmlu", "gsm8k", "esconv", "humaneval", "ifeval", "bias_disentangle"],
     )
     parser.add_argument(
         "--reference-evaluator",
         default="none",
-        choices=["none", "loss", "medqa", "mmlu", "gsm8k", "esconv", "humaneval", "bias_disentangle"],
+        choices=["none", "loss", "medqa", "mmlu", "gsm8k", "esconv", "humaneval", "ifeval", "bias_disentangle"],
     )
     parser.add_argument("--eval-max-examples", type=int, default=None)
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
@@ -1056,9 +1056,10 @@ def main() -> None:
                 )
             )
             append_jsonl(metrics_path, {"type": "benchmark_base", **base_eval_metrics})
-        if args.evaluate_base_ood and args.evaluator == "humaneval" and ood_eval_records:
-            humaneval_metrics = evaluate_records_with_config(
-                evaluator_name="humaneval",
+        ood_evaluator = args.ood_evaluator or args.evaluator
+        if args.evaluate_base_ood and ood_evaluator not in {"none", "bias_disentangle"} and ood_eval_records:
+            ood_metrics = evaluate_records_with_config(
+                evaluator_name=ood_evaluator,
                 model=base_model,
                 tokenizer=tokenizer,
                 records=ood_eval_records,
@@ -1071,8 +1072,27 @@ def main() -> None:
                 humaneval_temperature=args.humaneval_temperature,
                 humaneval_top_p=args.humaneval_top_p,
             )
-            base_eval_metrics.update({f"base_{key}": value for key, value in humaneval_metrics.items()})
-            append_jsonl(metrics_path, {"type": "base_ood_evaluation", **{f"base_{key}": value for key, value in humaneval_metrics.items()}})
+            prefixed_ood_base = {f"base_ood_{key}": value for key, value in ood_metrics.items()}
+            base_eval_metrics.update(prefixed_ood_base)
+            append_jsonl(metrics_path, {"type": "base_ood_evaluation", **prefixed_ood_base})
+        if args.reference_evaluator not in {"none", "loss", "bias_disentangle"} and reference_eval_records:
+            reference_base_metrics = evaluate_records_with_config(
+                evaluator_name=args.reference_evaluator,
+                model=base_model,
+                tokenizer=tokenizer,
+                records=reference_eval_records,
+                device=accelerator.device,
+                max_examples=args.eval_max_examples,
+                max_new_tokens=args.generation_max_new_tokens,
+                add_bos_token=args.add_bos_token,
+                humaneval_num_samples=args.humaneval_num_samples,
+                humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
+                humaneval_temperature=args.humaneval_temperature,
+                humaneval_top_p=args.humaneval_top_p,
+            )
+            prefixed_reference_base = {f"base_reference_{key}": value for key, value in reference_base_metrics.items()}
+            base_eval_metrics.update(prefixed_reference_base)
+            append_jsonl(metrics_path, {"type": "reference_base_evaluation", **prefixed_reference_base})
     accelerator.wait_for_everyone()
     model = attach_lora_adapter(base_model, args)
     # Validation-gradient and reference-Fisher probes run before `accelerator.prepare`,
@@ -1464,6 +1484,21 @@ def main() -> None:
                 output_dir=output_dir,
             )
         )
+        for key, value in list(summary.items()):
+            if key.startswith("reference_"):
+                prefix = "reference_"
+                base_prefix = "base_reference_"
+                delta_prefix = "reference_delta_"
+            elif key.startswith("ood_"):
+                prefix = "ood_"
+                base_prefix = "base_ood_"
+                delta_prefix = "ood_delta_"
+            else:
+                continue
+            metric_name = key.removeprefix(prefix)
+            base_key = f"{base_prefix}{metric_name}"
+            if base_key in summary and isinstance(value, (int, float)) and isinstance(summary[base_key], (int, float)):
+                summary[f"{delta_prefix}{metric_name}"] = float(value) - float(summary[base_key])
         save_json(summary_path, summary)
 
 

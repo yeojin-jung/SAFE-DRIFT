@@ -1224,6 +1224,8 @@ def build_train_command(args: argparse.Namespace, train_file: str | Path, run_ou
     train_script = Path(args.train_script)
     train_lora_target_modules = args.train_lora_target_modules or args.lora_target_modules
     train_model_name = args.train_model_name or args.model_name
+    validation_file = args.validation_file or args.target_file
+    eval_file = args.eval_file or args.target_file
     command = []
     if args.launcher == "accelerate":
         command.extend(["accelerate", "launch", "--num_processes", str(args.num_processes)])
@@ -1238,21 +1240,9 @@ def build_train_command(args: argparse.Namespace, train_file: str | Path, run_ou
             "--train-file",
             str(train_file),
             "--validation-file",
-            str(args.target_file),
-            "--validation-split-proportions",
-            *(str(value) for value in args.target_split_proportions),
-            "--validation-split-seed",
-            str(args.target_split_seed),
-            "--validation-split-role",
-            "val",
+            str(validation_file),
             "--eval-file",
-            str(args.target_file),
-            "--eval-split-proportions",
-            *(str(value) for value in args.target_split_proportions),
-            "--eval-split-seed",
-            str(args.target_split_seed),
-            "--eval-split-role",
-            "final_test",
+            str(eval_file),
             "--ood-eval-file",
             str(args.ood_eval_file),
             "--output-dir",
@@ -1309,6 +1299,28 @@ def build_train_command(args: argparse.Namespace, train_file: str | Path, run_ou
             str(args.max_grad_norm),
         ]
     )
+    if args.validation_file is None:
+        command.extend(
+            [
+                "--validation-split-proportions",
+                *(str(value) for value in args.target_split_proportions),
+                "--validation-split-seed",
+                str(args.target_split_seed),
+                "--validation-split-role",
+                "val",
+            ]
+        )
+    if args.eval_file is None:
+        command.extend(
+            [
+                "--eval-split-proportions",
+                *(str(value) for value in args.target_split_proportions),
+                "--eval-split-seed",
+                str(args.target_split_seed),
+                "--eval-split-role",
+                "final_test",
+            ]
+        )
     if args.ood_evaluator is not None:
         command.extend(["--ood-evaluator", args.ood_evaluator])
     if args.reference_evaluator is not None:
@@ -1661,6 +1673,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--candidate-file", default=str(DEFAULT_CANDIDATE_FILE))
     parser.add_argument("--target-file", default=str(DEFAULT_TARGET_FILE))
+    parser.add_argument(
+        "--validation-file",
+        default=None,
+        help="Optional pre-split validation/metrics file passed directly to SFT training.",
+    )
+    parser.add_argument(
+        "--eval-file",
+        default=None,
+        help="Optional pre-split final evaluation file passed directly to SFT training.",
+    )
     parser.add_argument("--ood-eval-file", default=str(DEFAULT_OOD_EVAL_FILE))
     parser.add_argument("--target-split-proportions", nargs=3, type=float, default=[0.34, 0.33, 0.33])
     parser.add_argument("--target-split-seed", type=int, default=42)
@@ -1922,6 +1944,8 @@ def main() -> None:
         "raw_candidate_count": len(raw_candidates),
         "candidate_pool": candidate_split_info,
         "target_file": str(Path(args.target_file).resolve()),
+        "validation_file": None if args.validation_file is None else str(Path(args.validation_file).resolve()),
+        "eval_file": None if args.eval_file is None else str(Path(args.eval_file).resolve()),
         "ood_eval_file": None if args.ood_eval_file is None else str(Path(args.ood_eval_file).resolve()),
         "target_split_proportions": args.target_split_proportions,
         "target_split_seed": args.target_split_seed,

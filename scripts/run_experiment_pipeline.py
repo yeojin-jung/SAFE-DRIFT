@@ -142,6 +142,8 @@ def build_sweep_command(
     base_args: dict[str, Any] = {
         "candidate_file": data["candidate_file"],
         "target_file": data["target_file"],
+        "validation_file": data.get("validation_file"),
+        "eval_file": data.get("eval_file"),
         "ood_eval_file": data.get("ood_eval_file"),
         "reference_file": data.get("reference_file"),
         "reference_hf_stereoset": data.get("reference_hf_stereoset", False),

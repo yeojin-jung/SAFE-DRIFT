@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from . import bias_disentangle, esconv, gsm8k, humaneval, medqa, mmlu
+from . import bias_disentangle, esconv, gsm8k, humaneval, ifeval, medqa, mmlu
 
 
 def _evaluate_none(*_args, **_kwargs) -> dict[str, float]:
@@ -16,6 +16,7 @@ EVALUATORS: dict[str, Callable[..., dict[str, float]]] = {
     "gsm8k": gsm8k.evaluate_records,
     "esconv": esconv.evaluate_records,
     "humaneval": humaneval.evaluate_records,
+    "ifeval": ifeval.evaluate_records,
     "bias_disentangle": bias_disentangle.evaluate_saved_adapter,
 }
 

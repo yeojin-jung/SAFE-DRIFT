@@ -48,6 +48,7 @@ src/
 | 1 | CodeAlpaca | HumanEval | StereoSet | HumanEval pass@1 |
 | 2 | MedMCQA | MedQA | TruthfulQA + BBQ, plus MCQ OOD | MedQA MCQ accuracy |
 | 3 | Empathetic Dialogues | ESConv | GSM8K | ESConv overlap metrics |
+| 4 | FLAN-v2 | IFEval | MMLU | IFEval strict/loose instruction-following |
 
 The setting configs are:
 
@@ -55,6 +56,7 @@ The setting configs are:
 configs/experiments/setting_1_code_humaneval.yaml
 configs/experiments/setting_2_medqa_medmcqa.yaml
 configs/experiments/setting_3_empathetic_esconv_gsm8k.yaml
+configs/experiments/setting_4_flan_ifeval_mmlu.yaml
 ```
 
 ## Shared Defaults
@@ -290,4 +292,3 @@ training_runs/*/metrics.jsonl
 training_runs/*/summary.json
 training_runs/*/final_adapter/
 ```
-

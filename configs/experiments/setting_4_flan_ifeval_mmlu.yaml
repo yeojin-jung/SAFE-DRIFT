@@ -1,0 +1,101 @@
+experiment:
+  id: setting_4_flan_ifeval_mmlu
+  name: "Setting 4: FLAN-v2 / IFEval / MMLU"
+
+prepare:
+  - command:
+      - python
+      - scripts/data/prepare_setting4_flan_ifeval_mmlu.py
+      - --flan-source
+      - data/raw/flan_v2_data.jsonl
+      - --out
+      - data/setting_4_flan_ifeval_mmlu/prepared
+      - --max-candidates
+      - "100000"
+      - --max-ifeval-target
+      - "42"
+      - --max-ifeval-eval
+      - "491"
+      - --max-mmlu-reference
+      - "285"
+      - --max-mmlu-eval
+      - "200"
+      - --overwrite
+
+data:
+  candidate_file: data/setting_4_flan_ifeval_mmlu/prepared/flan_v2_100k.jsonl
+  target_file: data/setting_4_flan_ifeval_mmlu/prepared/ifeval_validation_teacher_42.jsonl
+  validation_file: data/setting_4_flan_ifeval_mmlu/prepared/ifeval_validation_teacher_metrics_eval.jsonl
+  eval_file: data/setting_4_flan_ifeval_mmlu/prepared/ifeval_test_prompt_only.jsonl
+  ood_eval_file: data/setting_4_flan_ifeval_mmlu/prepared/mmlu_test_200.jsonl
+  reference_file: data/setting_4_flan_ifeval_mmlu/prepared/mmlu_validation_285.jsonl
+
+model_variants:
+  - name: olmo7b_gradient_equals_ft
+    gradient_model: allenai/OLMo-2-1124-7B
+    finetune_model: allenai/OLMo-2-1124-7B
+    enabled: true
+
+subset_percentages: [5.0, 15.0]
+
+splits:
+  candidate_adam_warmup: 0.03
+  candidate_selection: 0.97
+  target: [1.0, 0.0, 0.0]
+  reference: [0.5, 0.5]
+
+selection:
+  selector_feature_method: low_rank
+  selector_preconditioner: adam
+  max_seq_len: 1024
+  lora_r: 2
+  lora_alpha: 4
+  lora_dropout: 0.0
+  lora_target_modules: ["q_proj"]
+  adam_beta2: 0.999
+  adam_eps: 1.0e-8
+  adam_warmup_steps: 0.1
+  low_rank_builder_alpha: 1.0e-3
+  low_rank_delta: 0.01
+  low_rank_delta_task: 0.01
+  low_rank_reference_shrinkage: none
+  reference_fisher_max_examples: 1024
+  validation_gradient_max_examples: 256
+  compute_validation_gradient: true
+  compute_reference_fisher: true
+  safe_geometry: reference
+  safe_solver: greedy_marginal
+
+rank_grid:
+  - name: KR128_KT32
+    K_R: 128
+    K_T: 32
+
+safe:
+  epsilon: 2.0
+  rho_values: [2.0e-5]
+
+training:
+  train_max_seq_length: 4096
+  train_torch_dtype: bf16
+  train_lora_r: 64
+  train_lora_alpha: 256
+  train_lora_dropout: 0.1
+  train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 32
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  lr_scheduler_type: linear
+  max_grad_norm: 1.0
+  num_train_epochs: 2.0
+  eval_steps: 0
+
+evaluation:
+  evaluator: ifeval
+  ood_evaluator: mmlu
+  reference_evaluator: mmlu
+  generation_max_new_tokens: 32
+  benchmark_evals: []
