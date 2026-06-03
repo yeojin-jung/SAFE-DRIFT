@@ -29,7 +29,7 @@ training:
 
 evaluation:
   evaluator: humaneval
-  humaneval_num_samples: 1
-  humaneval_pass_at_ks: [1]
+  humaneval_num_samples: 10
+  humaneval_pass_at_ks: [1, 10]
   humaneval_temperature: 0.8
   humaneval_top_p: 0.95

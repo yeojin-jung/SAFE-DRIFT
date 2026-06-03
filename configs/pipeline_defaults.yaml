@@ -61,6 +61,8 @@ training:
 evaluation:
   generation_max_new_tokens: 128
   eval_max_examples: null
+  run_entanglement_analysis: true
+  entanglement_selector_top_k: 200
 
 rank_grid:
   - name: KR1024_KT256

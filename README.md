@@ -238,9 +238,11 @@ For each expanded command, `scripts/run_selector_sft_sweep_code.py`:
 5. Splits reference data into reference-Fisher and held-out reference-eval
    splits using `50/50`.
 6. Computes selector features with the low-rank reference Fisher geometry.
-7. Runs baseline selectors and SAFE-DRIFT.
-8. Fine-tunes a LoRA adapter on each selected subset.
-9. Writes metrics, summaries, selected subsets, feature caches, and adapters.
+7. Runs entanglement analysis for the low-rank selector feature cache.
+8. Runs baseline selectors and SAFE-DRIFT.
+9. Fine-tunes a LoRA adapter on each selected subset.
+10. Writes metrics, summaries, selected subsets, feature caches, analysis
+    outputs, and adapters.
 
 The current low-rank feature setup estimates the low-rank candidate basis from
 at most `5000` post-warmup candidates. All post-warmup candidates are still
@@ -288,6 +290,8 @@ pipeline_manifest.json
 selector_sft_sweep_manifest.json
 subsets/*.jsonl
 selector_feature_cache/
+entanglement_analysis/entanglement_summary.json
+entanglement_analysis/*/*.png
 training_runs/*/metrics.jsonl
 training_runs/*/summary.json
 training_runs/*/final_adapter/
