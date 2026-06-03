@@ -1518,6 +1518,19 @@ def run_training_command(command: list[str], dry_run: bool) -> tuple[float, int]
     return time.perf_counter() - start, int(completed.returncode)
 
 
+def copy_file_unless_same(src: Path, dst: Path) -> None:
+    if src.resolve() == dst.resolve():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def copytree_unless_same(src: Path, dst: Path) -> None:
+    if src.resolve() == dst.resolve():
+        return
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
 def evaluate_base_model_once(
     args: argparse.Namespace,
     *,
@@ -1547,9 +1560,9 @@ def evaluate_base_model_once(
         return None
     if shared_base_eval_path.exists():
         payload = json.loads(shared_base_eval_path.read_text(encoding="utf-8"))
-        shutil.copy2(shared_base_eval_path, base_eval_path)
+        copy_file_unless_same(shared_base_eval_path, base_eval_path)
         if shared_base_eval_output_dir.exists():
-            shutil.copytree(shared_base_eval_output_dir, base_eval_output_dir, dirs_exist_ok=True)
+            copytree_unless_same(shared_base_eval_output_dir, base_eval_output_dir)
         return payload
 
     payload: dict[str, Any] = {
@@ -1617,9 +1630,9 @@ def evaluate_base_model_once(
         payload.update(bias_metrics)
 
     write_json(payload, shared_base_eval_path)
-    shutil.copy2(shared_base_eval_path, base_eval_path)
+    copy_file_unless_same(shared_base_eval_path, base_eval_path)
     if shared_base_eval_output_dir.exists():
-        shutil.copytree(shared_base_eval_output_dir, base_eval_output_dir, dirs_exist_ok=True)
+        copytree_unless_same(shared_base_eval_output_dir, base_eval_output_dir)
     return payload
 
 

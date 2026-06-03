@@ -104,12 +104,14 @@ def rank_overrides(rank_spec: dict[str, Any]) -> dict[str, Any]:
             "low_rank_common_rank": "auto",
             "low_rank_auto_task_rank": True,
         }
-    return {
+    overrides = {
         "low_rank_reference_rank": rank_spec["K_R"],
         "low_rank_task_rank": rank_spec["K_T"],
-        "low_rank_common_rank": rank_spec.get("K", int(rank_spec["K_R"]) + int(rank_spec["K_T"])),
         "low_rank_auto_task_rank": False,
     }
+    if "K" in rank_spec:
+        overrides["low_rank_common_rank"] = rank_spec["K"]
+    return overrides
 
 
 def build_sweep_command(
