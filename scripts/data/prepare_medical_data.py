@@ -150,6 +150,12 @@ def sample_records(records: Sequence[dict[str, Any]], max_count: int, seed: int)
     return [records[index] for index in indices[:max_count]]
 
 
+def shuffle_records(records: Sequence[dict[str, Any]], seed: int) -> list[dict[str, Any]]:
+    ordered = list(records)
+    random.Random(seed).shuffle(ordered)
+    return ordered
+
+
 def split_primary_validation_test(
     records: Sequence[dict[str, Any]],
     *,
@@ -580,8 +586,14 @@ def build_medical_dataset(out_dir: Path, config: BuildConfig) -> dict[str, int]:
     target_train_ids = {record["id"] for record in target_train}
 
     print("[medical] loading MedQA dev/test ...", file=sys.stderr)
-    target_dev = format_medqa_split("dev", role="target_eval_dev")
-    target_test = format_medqa_split("test", role="target_eval_test")
+    target_dev = shuffle_records(
+        format_medqa_split("dev", role="target_eval_dev"),
+        config.seed + stable_int("target_dev"),
+    )
+    target_test = shuffle_records(
+        format_medqa_split("test", role="target_eval_test"),
+        config.seed + stable_int("target_test"),
+    )
 
     if config.candidate_source == "medmcqa":
         print("[medical] loading MedMCQA train candidates ...", file=sys.stderr)
