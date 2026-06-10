@@ -2,12 +2,16 @@ experiment:
   id: setting_3_empathetic_esconv_gsm8k
   name: "Setting 3: Empathetic Dialogues / ESConv / GSM8K"
 
+repeat_seeds: [42]
+
 prepare:
   - command:
       - python
       - scripts/data/prepare_empathetic_data.py
       - --out
-      - data/setting_3_empathetic/prepared
+      - data/setting_3_empathetic/prepared_{repeat_tag}
+      - --seed
+      - "{repeat_seed}"
       - --target-splits
       - train,validation,test
       - --max-target-train
@@ -29,14 +33,14 @@ prepare:
       - --overwrite
 
 data:
-  candidate_file: data/setting_3_empathetic/prepared/candidate_pool.jsonl
-  candidate_validation_file: data/setting_3_empathetic/prepared/candidate_validation.jsonl
-  candidate_test_file: data/setting_3_empathetic/prepared/candidate_test.jsonl
-  target_file: data/setting_3_empathetic/prepared/target_all.jsonl
-  ood_eval_file: data/setting_3_empathetic/prepared/reference_eval/gsm8k_test.jsonl
-  reference_file: data/setting_3_empathetic/prepared/reference_prompts.jsonl
-  reference_validation_file: data/setting_3_empathetic/prepared/reference_validation.jsonl
-  reference_test_file: data/setting_3_empathetic/prepared/reference_test.jsonl
+  candidate_file: data/setting_3_empathetic/prepared_{repeat_tag}/candidate_pool.jsonl
+  candidate_validation_file: data/setting_3_empathetic/prepared_{repeat_tag}/candidate_validation.jsonl
+  candidate_test_file: data/setting_3_empathetic/prepared_{repeat_tag}/candidate_test.jsonl
+  target_file: data/setting_3_empathetic/prepared_{repeat_tag}/target_all.jsonl
+  ood_eval_file: data/setting_3_empathetic/prepared_{repeat_tag}/reference_eval/gsm8k_test.jsonl
+  reference_file: data/setting_3_empathetic/prepared_{repeat_tag}/reference_prompts.jsonl
+  reference_validation_file: data/setting_3_empathetic/prepared_{repeat_tag}/reference_validation.jsonl
+  reference_test_file: data/setting_3_empathetic/prepared_{repeat_tag}/reference_test.jsonl
 
 model_variants:
   - name: olmo7b_instruct_gradient_equals_ft
@@ -53,11 +57,15 @@ subset_percentages: [5.0]
 
 splits:
   target: [100.0, 8741.0, 8742.0]
+  target_seed: "{repeat_seed}"
   reference: [1.0, 0.0]
+  reference_seed: "{repeat_seed}"
 
 selection:
   selector_feature_method: low_rank
   selector_preconditioner: adam
+  preconditioner_split_seed: "{repeat_seed}"
+  selector_projection_seed: "{repeat_seed}"
   save_selected_artifacts: true
   selection_torch_dtype: bf16
   max_seq_len: 1024

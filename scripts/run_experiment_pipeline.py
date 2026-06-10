@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import json
 import subprocess
 import sys
@@ -95,6 +96,56 @@ def repo_path(path: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
+def format_repeat_templates(value: Any, repeat: dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        return value.format(**repeat) if "{" in value else value
+    if isinstance(value, list):
+        return [format_repeat_templates(item, repeat) for item in value]
+    if isinstance(value, dict):
+        return {key: format_repeat_templates(item, repeat) for key, item in value.items()}
+    return value
+
+
+def repeat_specs(config: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_seeds = config.get("repeat_seeds", config.get("seeds"))
+    if raw_seeds is None:
+        raw_seeds = [config.get("seed", 42)]
+    seeds = [int(seed) for seed in as_list(raw_seeds)]
+    if not seeds:
+        raise ValueError("repeat_seeds must contain at least one seed.")
+    specs: list[dict[str, Any]] = []
+    for index, seed in enumerate(seeds):
+        tag = f"seed{safe_slug(seed)}"
+        specs.append(
+            {
+                "repeat_index": index,
+                "repeat_seed": seed,
+                "repeat_tag": tag,
+            }
+        )
+    return specs
+
+
+def config_for_repeat(config: dict[str, Any], repeat: dict[str, Any]) -> dict[str, Any]:
+    formatted = format_repeat_templates(copy.deepcopy(config), repeat)
+    seed = int(repeat["repeat_seed"])
+    formatted["_repeat_index"] = int(repeat["repeat_index"])
+    formatted["_repeat_seed"] = seed
+    formatted["_repeat_tag"] = str(repeat["repeat_tag"])
+    formatted["seed"] = int(formatted.get("seed", seed))
+
+    splits = dict(formatted.get("splits", {}))
+    splits.setdefault("target_seed", seed)
+    splits.setdefault("reference_seed", seed)
+    formatted["splits"] = splits
+
+    selection = dict(formatted.get("selection", {}))
+    selection.setdefault("preconditioner_split_seed", seed)
+    selection.setdefault("selector_projection_seed", seed)
+    formatted["selection"] = selection
+    return formatted
+
+
 def rank_overrides(rank_spec: dict[str, Any]) -> dict[str, Any]:
     mode = rank_spec.get("mode", "fixed")
     if mode == "auto":
@@ -137,17 +188,23 @@ def build_sweep_command(
     rank_name = str(rank_spec.get("name") or ("auto" if rank_spec.get("mode") == "auto" else f"KR{rank_spec['K_R']}_KT{rank_spec['K_T']}"))
     model_name = str(model_variant["name"])
     budget_name = f"pct{safe_slug(f'{float(subset_percentage):g}')}"
+    experiment_prefix = str(experiment["id"])
+    repeat_tag = config.get("_repeat_tag")
+    if repeat_tag is not None:
+        experiment_prefix = f"{experiment_prefix}/{repeat_tag}"
     if run_kind == "safe":
         variant_name = str((safe_variant or {}).get("name") or "safe")
         safe_name = f"{variant_name}_rho{safe_slug(f'{rho:g}')}"
         if include_safe_epsilon_in_name:
             safe_name += f"_eps{safe_slug(f'{float(safe_epsilon):g}')}"
-        run_name = f"{experiment['id']}/{model_name}/{rank_name}/{budget_name}/{safe_name}"
+        run_name = f"{experiment_prefix}/{model_name}/{rank_name}/{budget_name}/{safe_name}"
     else:
-        run_name = f"{experiment['id']}/{model_name}/{rank_name}/{budget_name}/baselines"
+        run_name = f"{experiment_prefix}/{model_name}/{rank_name}/{budget_name}/baselines"
     run_output = output_root / run_name
 
     command = [sys.executable, str(SWEEP_SCRIPT)]
+    target_split_seed = splits.get("target_seed", config.get("target_split_seed", config.get("seed", 42)))
+    reference_split_seed = splits.get("reference_seed", config.get("reference_split_seed", config.get("seed", 42)))
     base_args: dict[str, Any] = {
         "candidate_file": data["candidate_file"],
         "candidate_validation_file": data.get("candidate_validation_file"),
@@ -168,7 +225,9 @@ def build_sweep_command(
         if data.get("reference_hf_stereoset", False)
         else None,
         "target_split_proportions": splits.get("target", [0.34, 0.33, 0.33]),
+        "target_split_seed": target_split_seed,
         "reference_split_proportions": splits.get("reference", [0.5, 0.5]),
+        "reference_split_seed": reference_split_seed,
         "reference_split_group_key": splits.get("reference_group_key"),
         "subset_percentages": [subset_percentage],
         "selectors": config.get("baseline_selectors", ["full", "random", "dsir", "less", "prismatic"])
@@ -255,54 +314,72 @@ def build_prepare_commands(config: dict[str, Any]) -> list[list[str]]:
 
 def build_manifest(config: dict[str, Any]) -> dict[str, Any]:
     commands: list[dict[str, Any]] = []
-    model_variants = [variant for variant in config.get("model_variants", []) if variant.get("enabled", True)]
-    variants = safe_variants(config)
-    for model_variant in model_variants:
-        for rank_spec in config["rank_grid"]:
-            for subset_percentage in config["subset_percentages"]:
-                if config.get("run_baselines", True):
-                    name, command = build_sweep_command(
-                        config,
-                        run_kind="baseline",
-                        model_variant=model_variant,
-                        rank_spec=rank_spec,
-                        subset_percentage=float(subset_percentage),
-                        rho=None,
-                    )
-                    commands.append({"name": name, "kind": "baseline", "command": command})
-                for variant in variants:
-                    epsilons = safe_epsilon_values(config, variant)
-                    include_epsilon_in_name = (
-                        len(epsilons) > 1
-                        or "epsilon_values" in variant
-                        or "epsilon_values" in config.get("safe", {})
-                    )
-                    for epsilon in epsilons:
-                        for rho in safe_rho_values(config, variant):
-                            name, command = build_sweep_command(
-                                config,
-                                run_kind="safe",
-                                model_variant=model_variant,
-                                rank_spec=rank_spec,
-                                subset_percentage=float(subset_percentage),
-                                rho=float(rho),
-                                safe_variant=variant,
-                                safe_epsilon=float(epsilon),
-                                include_safe_epsilon_in_name=include_epsilon_in_name,
-                            )
-                            commands.append(
-                                {
-                                    "name": name,
-                                    "kind": "safe",
-                                    "variant": str(variant.get("name", "safe")),
-                                    "rho": float(rho),
-                                    "epsilon": float(epsilon),
-                                    "command": command,
-                                }
-                            )
+    prepare_commands: list[list[str]] = []
+    repeats = repeat_specs(config)
+    for repeat in repeats:
+        repeat_config = config_for_repeat(config, repeat)
+        prepare_commands.extend(build_prepare_commands(repeat_config))
+        model_variants = [variant for variant in repeat_config.get("model_variants", []) if variant.get("enabled", True)]
+        variants = safe_variants(repeat_config)
+        for model_variant in model_variants:
+            for rank_spec in repeat_config["rank_grid"]:
+                for subset_percentage in repeat_config["subset_percentages"]:
+                    if repeat_config.get("run_baselines", True):
+                        name, command = build_sweep_command(
+                            repeat_config,
+                            run_kind="baseline",
+                            model_variant=model_variant,
+                            rank_spec=rank_spec,
+                            subset_percentage=float(subset_percentage),
+                            rho=None,
+                        )
+                        commands.append(
+                            {
+                                "name": name,
+                                "kind": "baseline",
+                                "repeat_index": repeat["repeat_index"],
+                                "repeat_seed": repeat["repeat_seed"],
+                                "repeat_tag": repeat["repeat_tag"],
+                                "command": command,
+                            }
+                        )
+                    for variant in variants:
+                        epsilons = safe_epsilon_values(repeat_config, variant)
+                        include_epsilon_in_name = (
+                            len(epsilons) > 1
+                            or "epsilon_values" in variant
+                            or "epsilon_values" in repeat_config.get("safe", {})
+                        )
+                        for epsilon in epsilons:
+                            for rho in safe_rho_values(repeat_config, variant):
+                                name, command = build_sweep_command(
+                                    repeat_config,
+                                    run_kind="safe",
+                                    model_variant=model_variant,
+                                    rank_spec=rank_spec,
+                                    subset_percentage=float(subset_percentage),
+                                    rho=float(rho),
+                                    safe_variant=variant,
+                                    safe_epsilon=float(epsilon),
+                                    include_safe_epsilon_in_name=include_epsilon_in_name,
+                                )
+                                commands.append(
+                                    {
+                                        "name": name,
+                                        "kind": "safe",
+                                        "variant": str(variant.get("name", "safe")),
+                                        "rho": float(rho),
+                                        "epsilon": float(epsilon),
+                                        "repeat_index": repeat["repeat_index"],
+                                        "repeat_seed": repeat["repeat_seed"],
+                                        "repeat_tag": repeat["repeat_tag"],
+                                        "command": command,
+                                    }
+                                )
     return {
         "experiment": config["experiment"],
-        "prepare_commands": build_prepare_commands(config),
+        "repeats": repeats,
+        "prepare_commands": prepare_commands,
         "run_commands": commands,
     }
 

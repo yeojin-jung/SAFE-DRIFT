@@ -2,12 +2,16 @@ experiment:
   id: setting_2_medqa_medmcqa_truthfulqa_bbq_ifeval
   name: "Setting 2: MedQA / MedMCQA / TruthfulQA+BBQ+IFEval"
 
+repeat_seeds: [42]
+
 prepare:
   - command:
       - python
       - scripts/data/prepare_medical_data.py
       - --out
-      - data/setting_2_medical/prepared
+      - data/setting_2_medical/prepared_{repeat_tag}
+      - --seed
+      - "{repeat_seed}"
       - --max-target-train
       - "256"
       - --max-candidates
@@ -27,16 +31,16 @@ prepare:
       - --overwrite
 
 data:
-  candidate_file: data/setting_2_medical/prepared/candidate_pool.jsonl
-  candidate_validation_file: data/setting_2_medical/prepared/candidate_validation.jsonl
-  candidate_test_file: data/setting_2_medical/prepared/candidate_test.jsonl
-  target_file: data/setting_2_medical/prepared/target_train.jsonl
-  validation_file: data/setting_2_medical/prepared/target_dev.jsonl
-  eval_file: data/setting_2_medical/prepared/target_test.jsonl
-  ood_eval_file: data/setting_2_medical/prepared/reference_eval/mcq_ood_test.jsonl
-  reference_file: data/setting_2_medical/prepared/reference_prompts.jsonl
-  reference_validation_file: data/setting_2_medical/prepared/reference_validation.jsonl
-  reference_test_file: data/setting_2_medical/prepared/reference_test.jsonl
+  candidate_file: data/setting_2_medical/prepared_{repeat_tag}/candidate_pool.jsonl
+  candidate_validation_file: data/setting_2_medical/prepared_{repeat_tag}/candidate_validation.jsonl
+  candidate_test_file: data/setting_2_medical/prepared_{repeat_tag}/candidate_test.jsonl
+  target_file: data/setting_2_medical/prepared_{repeat_tag}/target_train.jsonl
+  validation_file: data/setting_2_medical/prepared_{repeat_tag}/target_dev.jsonl
+  eval_file: data/setting_2_medical/prepared_{repeat_tag}/target_test.jsonl
+  ood_eval_file: data/setting_2_medical/prepared_{repeat_tag}/reference_eval/mcq_ood_test.jsonl
+  reference_file: data/setting_2_medical/prepared_{repeat_tag}/reference_prompts.jsonl
+  reference_validation_file: data/setting_2_medical/prepared_{repeat_tag}/reference_validation.jsonl
+  reference_test_file: data/setting_2_medical/prepared_{repeat_tag}/reference_test.jsonl
 
 model_variants:
   - name: olmo7b_instruct_gradient_equals_ft
@@ -61,11 +65,15 @@ subset_percentages: [25.6]
 
 splits:
   target: [1.0, 0.0, 0.0]
+  target_seed: "{repeat_seed}"
   reference: [1.0, 0.0]
+  reference_seed: "{repeat_seed}"
 
 selection:
   selector_feature_method: low_rank
   selector_preconditioner: adam
+  preconditioner_split_seed: "{repeat_seed}"
+  selector_projection_seed: "{repeat_seed}"
   save_selected_artifacts: true
   less_similarity: cosine
   selection_torch_dtype: bf16
