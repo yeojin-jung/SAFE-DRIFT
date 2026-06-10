@@ -65,6 +65,8 @@ evaluation:
   compute_entanglement_metrics: false
   entanglement_target_sample_size: 128
   entanglement_selected_csv_max_rows: 5000
+  run_entanglement_analysis: true
+  entanglement_selector_top_k: 200
 
 rank_grid:
   - name: KR1024_KT256

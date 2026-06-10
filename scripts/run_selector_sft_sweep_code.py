@@ -998,6 +998,9 @@ def get_shared_selector_features(
             "selector_feature_cache_path": cache_key,
         }
         print_shared_feature_summary(info)
+        entanglement_info = maybe_run_entanglement_analysis(args, features)
+        if entanglement_info is not None:
+            info["entanglement_analysis"] = entanglement_info
         return SharedSelectorFeatures(
             candidate_features=features.candidate_features,
             target_feature=features.target_feature,
@@ -1009,9 +1012,97 @@ def get_shared_selector_features(
 
     features = compute_or_load_shared_selector_features(args, candidates, targets, references)
     print_shared_feature_summary(features.info)
+    entanglement_info = maybe_run_entanglement_analysis(args, features)
+    if entanglement_info is not None:
+        features.info["entanglement_analysis"] = entanglement_info
     setattr(args, "_shared_selector_features", features)
     setattr(args, "_shared_selector_features_key", cache_key)
     return features
+
+
+def entanglement_analysis_output_dir(args: argparse.Namespace) -> Path:
+    if args.entanglement_output_dir:
+        return Path(args.entanglement_output_dir)
+    return Path(args.feature_cache_dir).resolve().parent / "entanglement_analysis"
+
+
+def maybe_run_entanglement_analysis(
+    args: argparse.Namespace,
+    features: SharedSelectorFeatures,
+) -> dict[str, Any] | None:
+    if not args.run_entanglement_analysis:
+        return None
+    if args.selector_feature_method != "low_rank":
+        return {
+            "status": "skipped",
+            "reason": "requires low_rank selector features",
+        }
+
+    cache_path_raw = features.info.get("selector_feature_cache_path")
+    if not cache_path_raw:
+        return {
+            "status": "skipped",
+            "reason": "selector feature cache path unavailable",
+        }
+    cache_path = Path(cache_path_raw).resolve()
+    if not cache_path.exists():
+        return {
+            "status": "skipped",
+            "reason": "selector feature cache missing",
+            "selector_feature_cache_path": str(cache_path),
+        }
+
+    completed: dict[str, dict[str, Any]] = getattr(args, "_entanglement_analysis_results", {})
+    cache_key = str(cache_path)
+    if cache_key in completed:
+        return completed[cache_key]
+
+    from evaluation.entanglement_analysis import analyze_one, discover_feature_files
+
+    cache_root = Path(args.feature_cache_dir).resolve().parent
+    out_root = entanglement_analysis_output_dir(args).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        feature_files = discover_feature_files(cache_root)
+    except FileNotFoundError:
+        feature_files = {}
+    tag = next((candidate_tag for candidate_tag, path in feature_files.items() if path.resolve() == cache_path), cache_path.stem)
+
+    print(f"[entanglement] analyzing selector cache: {cache_path}")
+    summary = analyze_one(tag, cache_path, out_root, selector_top_k=args.entanglement_selector_top_k)
+    summary_path = out_root / "entanglement_summary.json"
+
+    if summary is None:
+        result = {
+            "status": "skipped",
+            "reason": "analysis returned no summary",
+            "selector_feature_cache_path": str(cache_path),
+            "output_dir": str((out_root / tag).resolve()),
+            "summary_file": None,
+            "tag": tag,
+        }
+    else:
+        all_summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+        all_summary[tag] = summary
+        summary_path.write_text(json.dumps(all_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        result = {
+            "status": "completed",
+            "selector_feature_cache_path": str(cache_path),
+            "output_dir": str((out_root / tag).resolve()),
+            "summary_file": str(summary_path.resolve()),
+            "tag": tag,
+        }
+        print(f"[entanglement] wrote summary: {summary_path}")
+
+    completed[cache_key] = result
+    setattr(args, "_entanglement_analysis_results", completed)
+    return result
+
+
+def collect_entanglement_analysis_results(args: argparse.Namespace) -> list[dict[str, Any]]:
+    completed: dict[str, dict[str, Any]] = getattr(args, "_entanglement_analysis_results", {})
+    return list(completed.values())
 
 
 def selector_update_preconditioner(args: argparse.Namespace, features: SharedSelectorFeatures) -> torch.Tensor | None:
@@ -1792,6 +1883,19 @@ def run_training_command(command: list[str], dry_run: bool) -> tuple[float, int]
     return time.perf_counter() - start, int(completed.returncode)
 
 
+def copy_file_unless_same(src: Path, dst: Path) -> None:
+    if src.resolve() == dst.resolve():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def copytree_unless_same(src: Path, dst: Path) -> None:
+    if src.resolve() == dst.resolve():
+        return
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
 def evaluate_base_model_once(
     args: argparse.Namespace,
     *,
@@ -1821,9 +1925,9 @@ def evaluate_base_model_once(
         return None
     if shared_base_eval_path.exists():
         payload = json.loads(shared_base_eval_path.read_text(encoding="utf-8"))
-        shutil.copy2(shared_base_eval_path, base_eval_path)
+        copy_file_unless_same(shared_base_eval_path, base_eval_path)
         if shared_base_eval_output_dir.exists():
-            shutil.copytree(shared_base_eval_output_dir, base_eval_output_dir, dirs_exist_ok=True)
+            copytree_unless_same(shared_base_eval_output_dir, base_eval_output_dir)
         return payload
 
     payload: dict[str, Any] = {
@@ -1891,9 +1995,9 @@ def evaluate_base_model_once(
         payload.update(bias_metrics)
 
     write_json(payload, shared_base_eval_path)
-    shutil.copy2(shared_base_eval_path, base_eval_path)
+    copy_file_unless_same(shared_base_eval_path, base_eval_path)
     if shared_base_eval_output_dir.exists():
-        shutil.copytree(shared_base_eval_output_dir, base_eval_output_dir, dirs_exist_ok=True)
+        copytree_unless_same(shared_base_eval_output_dir, base_eval_output_dir)
     return payload
 
 
@@ -2091,6 +2195,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-training", action="store_true")
     parser.add_argument("--skip-final-evaluation", action="store_true")
     parser.add_argument("--save-selected-artifacts", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--run-entanglement-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run entanglement analysis for low-rank selector feature caches.",
+    )
+    parser.add_argument(
+        "--entanglement-output-dir",
+        default=None,
+        help="Optional entanglement analysis output directory. Defaults to <feature-cache-dir parent>/entanglement_analysis.",
+    )
+    parser.add_argument(
+        "--entanglement-selector-top-k",
+        type=int,
+        default=200,
+        help="Number of top-influence candidates to highlight in entanglement analysis plots.",
+    )
 
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--selection-output-dir", default=str(DEFAULT_OUTPUT_DIR / "subsets"))
@@ -2355,6 +2476,12 @@ def main() -> None:
         "preconditioner_split_seed": args.preconditioner_split_seed,
         "less_similarity": args.less_similarity,
         "feature_cache_dir": str(Path(args.feature_cache_dir).resolve()),
+        "entanglement_analysis": {
+            "enabled": bool(args.run_entanglement_analysis),
+            "output_dir": str(entanglement_analysis_output_dir(args).resolve()),
+            "summary_file": str((entanglement_analysis_output_dir(args).resolve() / "entanglement_summary.json")),
+            "selector_top_k": int(args.entanglement_selector_top_k),
+        },
         "selector_projection_dim": args.selector_projection_dim,
         "selector_projection_seed": args.selector_projection_seed,
         "selector_projection_chunk_size": args.selector_projection_chunk_size,
@@ -2381,6 +2508,7 @@ def main() -> None:
     if args.prepare_shared_selector_cache_only:
         get_shared_selector_features(args, candidates, targets, references)
         manifest["prepared_shared_selector_cache_only"] = True
+        manifest["entanglement_analysis"]["results"] = collect_entanglement_analysis_results(args)
         manifest_path = output_dir / "selector_sft_sweep_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, ensure_ascii=False)
@@ -2477,6 +2605,7 @@ def main() -> None:
             )
 
     manifest_path = output_dir / "selector_sft_sweep_manifest.json"
+    manifest["entanglement_analysis"]["results"] = collect_entanglement_analysis_results(args)
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, ensure_ascii=False)
 
