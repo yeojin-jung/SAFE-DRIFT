@@ -8,6 +8,7 @@ selector_feature_method: low_rank
 selector_preconditioner: adam
 safe_geometry: reference
 safe_solver: greedy_marginal
+save_selected_artifacts: false
 
 max_seq_len: 2048
 selector_projection_dim: 8192
@@ -31,6 +32,9 @@ num_train_epochs: 1.0
 
 evaluator: humaneval
 generation_max_new_tokens: 256
+compute_entanglement_metrics: false
+entanglement_target_sample_size: 128
+entanglement_selected_csv_max_rows: 5000
 humaneval_num_samples: 1
 humaneval_pass_at_ks: [1]
 humaneval_temperature: 0.8

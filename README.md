@@ -138,12 +138,21 @@ python scripts/run_experiment_pipeline.py \
 This writes:
 
 ```text
-data/setting_2_medical/prepared/target_all.jsonl
+data/setting_2_medical/prepared/target_train.jsonl
+data/setting_2_medical/prepared/target_dev.jsonl
+data/setting_2_medical/prepared/target_test.jsonl
 data/setting_2_medical/prepared/candidate_pool.jsonl
+data/setting_2_medical/prepared/candidate_validation.jsonl
+data/setting_2_medical/prepared/candidate_test.jsonl
 data/setting_2_medical/prepared/reference_prompts.jsonl
-data/setting_2_medical/prepared/reference_eval/mcq_ood_eval.jsonl
+data/setting_2_medical/prepared/reference_validation.jsonl
+data/setting_2_medical/prepared/reference_test.jsonl
+data/setting_2_medical/prepared/reference_eval/mcq_ood_test.jsonl
 data/setting_2_medical/prepared/manifest.json
 ```
+
+For Settings 2 and 3, the `*_validation.jsonl` holdouts are for hyperparameter
+selection; the `*_test.jsonl` holdouts are reserved for final reporting.
 
 Prepare Setting 3:
 
@@ -161,8 +170,12 @@ data/setting_3_empathetic/prepared/target_all.jsonl
 data/setting_3_empathetic/prepared/target_train.jsonl
 data/setting_3_empathetic/prepared/target_eval.jsonl
 data/setting_3_empathetic/prepared/candidate_pool.jsonl
+data/setting_3_empathetic/prepared/candidate_validation.jsonl
+data/setting_3_empathetic/prepared/candidate_test.jsonl
 data/setting_3_empathetic/prepared/reference_prompts.jsonl
-data/setting_3_empathetic/prepared/reference_eval/gsm8k.jsonl
+data/setting_3_empathetic/prepared/reference_validation.jsonl
+data/setting_3_empathetic/prepared/reference_test.jsonl
+data/setting_3_empathetic/prepared/reference_eval/gsm8k_test.jsonl
 data/setting_3_empathetic/prepared/manifest.json
 ```
 
@@ -273,6 +286,14 @@ reference eval: GSM8K numeric accuracy
 Training metrics are written to `metrics.jsonl`. Final metrics are written to
 `summary.json`.
 
+When `compute_entanglement_metrics: true` is set, each selector run also writes
+reference/task entanglement diagnostics for its selected subset. These metrics
+summarize reference-subspace energy, preconditioner-weighted reference share,
+reference load, influence block decomposition, and target/reference alignment.
+SAFE runs also report `safe_constraint_report` in the sweep manifest, including
+the alpha case and whether the continuous update and selected subset satisfy
+the rho/reference and epsilon/norm budgets.
+
 ## Outputs
 
 Outputs are written under:
@@ -290,5 +311,11 @@ subsets/*.jsonl
 selector_feature_cache/
 training_runs/*/metrics.jsonl
 training_runs/*/summary.json
+training_runs/*/selection_artifacts/selected_candidates.jsonl
+training_runs/*/selection_artifacts/selected_candidate_indices.json
+training_runs/*/selection_artifacts/selected_candidate_features.pt
+training_runs/*/selection_artifacts/selected_candidate_gradients.pt
+training_runs/*/entanglement/entanglement_summary.json
+training_runs/*/entanglement/selected_subset_entanglement_metrics.csv
 training_runs/*/final_adapter/
 ```

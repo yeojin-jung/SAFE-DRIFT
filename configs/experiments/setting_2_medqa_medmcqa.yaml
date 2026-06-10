@@ -1,6 +1,6 @@
 experiment:
-  id: setting_2_medqa_medmcqa_truthfulqa_bbq
-  name: "Setting 2: MedQA / MedMCQA / TruthfulQA+BBQ"
+  id: setting_2_medqa_medmcqa_truthfulqa_bbq_ifeval
+  name: "Setting 2: MedQA / MedMCQA / TruthfulQA+BBQ+IFEval"
 
 prepare:
   - command:
@@ -11,18 +11,32 @@ prepare:
       - --max-target-train
       - "256"
       - --max-candidates
-      - "50000"
+      - "2000"
+      - --max-candidate-validation
+      - "256"
+      - --max-candidate-test
+      - "256"
       - --max-reference-per-dataset
-      - "500"
+      - "256"
+      - --max-reference-validation-per-dataset
+      - "128"
+      - --max-reference-test-per-dataset
+      - "128"
       - --reference-datasets
-      - truthfulqa,bbq
+      - ifeval,truthfulqa,bbq
       - --overwrite
 
 data:
   candidate_file: data/setting_2_medical/prepared/candidate_pool.jsonl
-  target_file: data/setting_2_medical/prepared/target_all.jsonl
-  ood_eval_file: data/setting_2_medical/prepared/reference_eval/mcq_ood_eval.jsonl
+  candidate_validation_file: data/setting_2_medical/prepared/candidate_validation.jsonl
+  candidate_test_file: data/setting_2_medical/prepared/candidate_test.jsonl
+  target_file: data/setting_2_medical/prepared/target_train.jsonl
+  validation_file: data/setting_2_medical/prepared/target_dev.jsonl
+  eval_file: data/setting_2_medical/prepared/target_test.jsonl
+  ood_eval_file: data/setting_2_medical/prepared/reference_eval/mcq_ood_test.jsonl
   reference_file: data/setting_2_medical/prepared/reference_prompts.jsonl
+  reference_validation_file: data/setting_2_medical/prepared/reference_validation.jsonl
+  reference_test_file: data/setting_2_medical/prepared/reference_test.jsonl
 
 model_variants:
   - name: olmo7b_instruct_gradient_equals_ft
@@ -32,7 +46,7 @@ model_variants:
   - name: olmo7b_instruct_to_base_transfer
     gradient_model: allenai/OLMo-2-1124-7B-Instruct
     finetune_model: allenai/OLMo-2-1124-7B
-    enabled: true
+    enabled: false
   - name: olmo7b_instruct_to_qwen_transfer
     gradient_model: allenai/OLMo-2-1124-7B-Instruct
     finetune_model: Qwen/Qwen2.5-7B
@@ -42,13 +56,105 @@ model_variants:
     finetune_model: mistralai/Mistral-7B-v0.3
     enabled: false
 
+baseline_selectors: ["random", "dsir", "less", "prismatic"]
+subset_percentages: [25.6]
+
+splits:
+  target: [1.0, 0.0, 0.0]
+  reference: [1.0, 0.0]
+
+selection:
+  selector_feature_method: low_rank
+  selector_preconditioner: adam
+  save_selected_artifacts: true
+  less_similarity: cosine
+  selection_torch_dtype: bf16
+  max_seq_len: 1024
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  low_rank_builder_alpha: 1.0e-3
+  low_rank_delta: 0.01
+  low_rank_delta_task: 0.01
+  reference_fisher_max_examples: 256
+  validation_gradient_max_examples: 256
+  low_rank_target_max_examples: 256
+  low_rank_candidate_max_examples: 256
+  low_rank_candidate_projection_chunk_rows: 128
+  safe_geometry: reference
+  safe_solver: greedy_marginal
+  safe_learning_rate: 2.0e-4
+  compute_validation_gradient: true
+  compute_reference_fisher: true
+
+rank_grid:
+  - name: KR64_KT16
+    K_R: 64
+    K_T: 16
+    K: 80
+
+safe:
+  epsilon: 1.0
+  epsilon_values: [1.0, 1.0e-4]
+  rho_values: [1.0e-8, 1.0e-6, 1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0, 100.0]
+  variants:
+    - name: safe_reference_precondadam
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+    - name: safe_reference_precondsgd
+      selector_feature_method: low_rank
+      selector_preconditioner: sgd
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+    - name: safe_euclidean_precondadam
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      safe_geometry: euclidean
+      safe_solver: greedy_marginal
+    - name: safe_euclidean_precondsgd
+      selector_feature_method: low_rank
+      selector_preconditioner: sgd
+      safe_geometry: euclidean
+      safe_solver: greedy_marginal
+    - name: safe_rank_precondadam
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      safe_geometry: reference
+      safe_solver: rank
+    - name: safe_rank_precondsgd
+      selector_feature_method: low_rank
+      selector_preconditioner: sgd
+      safe_geometry: reference
+      safe_solver: rank
+    - name: safe_random_sketch_precondadam
+      selector_feature_method: random_sketch
+      selector_preconditioner: adam
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+    - name: safe_random_sketch_precondsgd
+      selector_feature_method: random_sketch
+      selector_preconditioner: sgd
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+
 training:
   train_lora_r: 16
   train_lora_alpha: 32
-  train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  train_torch_dtype: bf16
+  train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  num_train_epochs: 2.0
+  eval_steps: 0
+  save_steps: 0
 
 evaluation:
   evaluator: medqa
   ood_evaluator: medqa
   reference_evaluator: loss
+  generation_max_new_tokens: 32
+  compute_entanglement_metrics: true
+  entanglement_target_sample_size: 128
+  entanglement_selected_csv_max_rows: 5000
   benchmark_evals: []

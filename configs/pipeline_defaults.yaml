@@ -18,6 +18,7 @@ selection:
   max_seq_len: 1024
   selector_feature_method: low_rank
   selector_preconditioner: adam
+  save_selected_artifacts: false
   # Random-sketch feature parameters. These are ignored when
   # selector_feature_method: low_rank, but kept here for explicit ablations.
   selector_projection_dim: 8192
@@ -61,6 +62,9 @@ training:
 evaluation:
   generation_max_new_tokens: 128
   eval_max_examples: null
+  compute_entanglement_metrics: false
+  entanglement_target_sample_size: 128
+  entanglement_selected_csv_max_rows: 5000
 
 rank_grid:
   - name: KR1024_KT256

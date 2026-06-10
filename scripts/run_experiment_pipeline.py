@@ -120,6 +120,9 @@ def build_sweep_command(
     rank_spec: dict[str, Any],
     subset_percentage: float,
     rho: float | None,
+    safe_variant: dict[str, Any] | None = None,
+    safe_epsilon: float | None = None,
+    include_safe_epsilon_in_name: bool = False,
 ) -> tuple[str, list[str]]:
     experiment = config["experiment"]
     data = config["data"]
@@ -133,7 +136,11 @@ def build_sweep_command(
     model_name = str(model_variant["name"])
     budget_name = f"pct{safe_slug(f'{float(subset_percentage):g}')}"
     if run_kind == "safe":
-        run_name = f"{experiment['id']}/{model_name}/{rank_name}/{budget_name}/safe_rho{safe_slug(f'{rho:g}')}"
+        variant_name = str((safe_variant or {}).get("name") or "safe")
+        safe_name = f"{variant_name}_rho{safe_slug(f'{rho:g}')}"
+        if include_safe_epsilon_in_name:
+            safe_name += f"_eps{safe_slug(f'{float(safe_epsilon):g}')}"
+        run_name = f"{experiment['id']}/{model_name}/{rank_name}/{budget_name}/{safe_name}"
     else:
         run_name = f"{experiment['id']}/{model_name}/{rank_name}/{budget_name}/baselines"
     run_output = output_root / run_name
@@ -141,11 +148,15 @@ def build_sweep_command(
     command = [sys.executable, str(SWEEP_SCRIPT)]
     base_args: dict[str, Any] = {
         "candidate_file": data["candidate_file"],
+        "candidate_validation_file": data.get("candidate_validation_file"),
+        "candidate_test_file": data.get("candidate_test_file"),
         "target_file": data["target_file"],
         "validation_file": data.get("validation_file"),
         "eval_file": data.get("eval_file"),
         "ood_eval_file": data.get("ood_eval_file"),
         "reference_file": data.get("reference_file"),
+        "reference_validation_file": data.get("reference_validation_file"),
+        "reference_test_file": data.get("reference_test_file"),
         "reference_hf_stereoset": data.get("reference_hf_stereoset", False),
         "reference_hf_subset": data.get("reference_hf_subset"),
         "reference_hf_split": data.get("reference_hf_split"),
@@ -171,14 +182,60 @@ def build_sweep_command(
         "train_cache_dir": str(run_output / "train_cache"),
     }
     base_args.update(selection)
+    if run_kind == "safe" and safe_variant:
+        base_args.update(
+            {
+                key: value
+                for key, value in safe_variant.items()
+                if key not in {"name", "rho_values", "epsilon", "epsilon_values"}
+            }
+        )
     base_args.update(training)
     base_args.update(evaluation)
     base_args.update(rank_overrides(rank_spec))
     if run_kind == "safe":
-        base_args.update({"safe_alpha": "auto", "safe_cost_c": rho, "safe_epsilon": config["safe"]["epsilon"]})
+        epsilon = config["safe"].get("epsilon") if safe_epsilon is None else safe_epsilon
+        base_args.update({"safe_alpha": "auto", "safe_cost_c": rho, "safe_epsilon": epsilon})
     for key, value in base_args.items():
         add_flag(command, key, value)
     return run_name, command
+
+
+def safe_variants(config: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_variants = config.get("safe", {}).get("variants")
+    if raw_variants is None:
+        return [{"name": "safe"}]
+    variants: list[dict[str, Any]] = []
+    for item in as_list(raw_variants):
+        if isinstance(item, dict):
+            variants.append(dict(item))
+        else:
+            variants.append({"name": str(item)})
+    if not variants:
+        raise ValueError("safe.variants must not be empty when provided.")
+    return variants
+
+
+def safe_epsilon_values(config: dict[str, Any], variant: dict[str, Any] | None = None) -> list[float]:
+    safe_config = config.get("safe", {})
+    variant = variant or {}
+    raw_values = variant.get("epsilon_values", safe_config.get("epsilon_values"))
+    if raw_values is None:
+        raw_values = [variant.get("epsilon", safe_config.get("epsilon"))]
+    values = [float(value) for value in as_list(raw_values) if value is not None]
+    if not values:
+        raise ValueError("SAFE runs require safe.epsilon or safe.epsilon_values in the config.")
+    return list(dict.fromkeys(values))
+
+
+def safe_rho_values(config: dict[str, Any], variant: dict[str, Any] | None = None) -> list[float]:
+    safe_config = config.get("safe", {})
+    variant = variant or {}
+    raw_values = variant.get("rho_values", safe_config.get("rho_values"))
+    values = [float(value) for value in as_list(raw_values)]
+    if not values:
+        raise ValueError("SAFE runs require safe.rho_values or per-variant rho_values in the config.")
+    return values
 
 
 def build_prepare_commands(config: dict[str, Any]) -> list[list[str]]:
@@ -197,6 +254,7 @@ def build_prepare_commands(config: dict[str, Any]) -> list[list[str]]:
 def build_manifest(config: dict[str, Any]) -> dict[str, Any]:
     commands: list[dict[str, Any]] = []
     model_variants = [variant for variant in config.get("model_variants", []) if variant.get("enabled", True)]
+    variants = safe_variants(config)
     for model_variant in model_variants:
         for rank_spec in config["rank_grid"]:
             for subset_percentage in config["subset_percentages"]:
@@ -210,16 +268,36 @@ def build_manifest(config: dict[str, Any]) -> dict[str, Any]:
                         rho=None,
                     )
                     commands.append({"name": name, "kind": "baseline", "command": command})
-                for rho in config["safe"]["rho_values"]:
-                    name, command = build_sweep_command(
-                        config,
-                        run_kind="safe",
-                        model_variant=model_variant,
-                        rank_spec=rank_spec,
-                        subset_percentage=float(subset_percentage),
-                        rho=float(rho),
+                for variant in variants:
+                    epsilons = safe_epsilon_values(config, variant)
+                    include_epsilon_in_name = (
+                        len(epsilons) > 1
+                        or "epsilon_values" in variant
+                        or "epsilon_values" in config.get("safe", {})
                     )
-                    commands.append({"name": name, "kind": "safe", "rho": float(rho), "command": command})
+                    for epsilon in epsilons:
+                        for rho in safe_rho_values(config, variant):
+                            name, command = build_sweep_command(
+                                config,
+                                run_kind="safe",
+                                model_variant=model_variant,
+                                rank_spec=rank_spec,
+                                subset_percentage=float(subset_percentage),
+                                rho=float(rho),
+                                safe_variant=variant,
+                                safe_epsilon=float(epsilon),
+                                include_safe_epsilon_in_name=include_epsilon_in_name,
+                            )
+                            commands.append(
+                                {
+                                    "name": name,
+                                    "kind": "safe",
+                                    "variant": str(variant.get("name", "safe")),
+                                    "rho": float(rho),
+                                    "epsilon": float(epsilon),
+                                    "command": command,
+                                }
+                            )
     return {
         "experiment": config["experiment"],
         "prepare_commands": build_prepare_commands(config),

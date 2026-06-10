@@ -744,6 +744,7 @@ def run_required_final_evaluations(
     accelerator: Accelerator,
     eval_records: list[dict[str, Any]],
     ood_eval_records: list[dict[str, Any]],
+    reference_validation_records: list[dict[str, Any]],
     reference_eval_records: list[dict[str, Any]],
     final_dir: Path,
     output_dir: Path,
@@ -787,6 +788,23 @@ def run_required_final_evaluations(
             humaneval_top_p=args.humaneval_top_p,
         )
         summary_updates.update(prefixed_metrics("ood_", ood_metrics))
+
+    if args.reference_evaluator not in {"none", "loss", "bias_disentangle"} and reference_validation_records:
+        reference_validation_metrics = evaluate_records_with_config(
+            evaluator_name=args.reference_evaluator,
+            model=unwrapped,
+            tokenizer=tokenizer,
+            records=reference_validation_records,
+            device=accelerator.device,
+            max_examples=args.eval_max_examples,
+            max_new_tokens=args.generation_max_new_tokens,
+            add_bos_token=args.add_bos_token,
+            humaneval_num_samples=args.humaneval_num_samples,
+            humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
+            humaneval_temperature=args.humaneval_temperature,
+            humaneval_top_p=args.humaneval_top_p,
+        )
+        summary_updates.update(prefixed_metrics("reference_validation_", reference_validation_metrics))
 
     if args.reference_evaluator not in {"none", "loss", "bias_disentangle"} and reference_eval_records:
         reference_metrics = evaluate_records_with_config(
@@ -838,6 +856,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="General LoRA SFT runner with pluggable evaluation heads.")
     parser.add_argument("--model-name-or-path", required=True)
     parser.add_argument("--train-file", required=True)
+    parser.add_argument("--candidate-validation-file", default=None)
+    parser.add_argument("--candidate-test-file", default=None)
     parser.add_argument("--validation-file", default=None)
     parser.add_argument("--validation-split-proportions", nargs=3, type=float, default=None)
     parser.add_argument("--validation-split-seed", type=int, default=42)
@@ -848,6 +868,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-split-role", choices=["selector_target", "val", "final_test"], default=None)
     parser.add_argument("--ood-eval-file", default=None)
     parser.add_argument("--reference-file", default=None)
+    parser.add_argument("--reference-validation-file", default=None)
+    parser.add_argument("--reference-test-file", default=None)
     parser.add_argument("--reference-hf-stereoset", action="store_true")
     parser.add_argument("--reference-hf-subset", default="intrasentence")
     parser.add_argument("--reference-hf-split", default="validation")
@@ -961,6 +983,8 @@ def main() -> None:
         save_json(config_path, vars(args))
 
     train_records = load_records(args.train_file)
+    candidate_validation_records = load_records(args.candidate_validation_file) if args.candidate_validation_file else []
+    candidate_test_records = load_records(args.candidate_test_file) if args.candidate_test_file else []
     validation_records = load_records(args.validation_file) if args.validation_file else []
     validation_records = apply_named_split(
         validation_records,
@@ -1006,8 +1030,9 @@ def main() -> None:
         names=["reference", "bias_eval"],
         group_key=args.reference_split_group_key,
     )
-    reference_eval_records = []
-    if all_reference_records and args.reference_split_proportions:
+    reference_validation_records = load_records(args.reference_validation_file) if args.reference_validation_file else []
+    reference_eval_records = load_records(args.reference_test_file) if args.reference_test_file else []
+    if not reference_eval_records and all_reference_records and args.reference_split_proportions:
         reference_eval_records = apply_named_split(
             all_reference_records,
             proportions=args.reference_split_proportions,
@@ -1093,6 +1118,30 @@ def main() -> None:
             prefixed_reference_base = {f"base_reference_{key}": value for key, value in reference_base_metrics.items()}
             base_eval_metrics.update(prefixed_reference_base)
             append_jsonl(metrics_path, {"type": "reference_base_evaluation", **prefixed_reference_base})
+        if args.reference_evaluator not in {"none", "loss", "bias_disentangle"} and reference_validation_records:
+            reference_validation_base_metrics = evaluate_records_with_config(
+                evaluator_name=args.reference_evaluator,
+                model=base_model,
+                tokenizer=tokenizer,
+                records=reference_validation_records,
+                device=accelerator.device,
+                max_examples=args.eval_max_examples,
+                max_new_tokens=args.generation_max_new_tokens,
+                add_bos_token=args.add_bos_token,
+                humaneval_num_samples=args.humaneval_num_samples,
+                humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
+                humaneval_temperature=args.humaneval_temperature,
+                humaneval_top_p=args.humaneval_top_p,
+            )
+            prefixed_reference_validation_base = {
+                f"base_reference_validation_{key}": value
+                for key, value in reference_validation_base_metrics.items()
+            }
+            base_eval_metrics.update(prefixed_reference_validation_base)
+            append_jsonl(
+                metrics_path,
+                {"type": "reference_validation_base_evaluation", **prefixed_reference_validation_base},
+            )
     accelerator.wait_for_everyone()
     model = attach_lora_adapter(base_model, args)
     # Validation-gradient and reference-Fisher probes run before `accelerator.prepare`,
@@ -1110,6 +1159,32 @@ def main() -> None:
     )
     if not tokenized_train:
         raise ValueError("No train examples contain supervised assistant tokens after truncation.")
+    tokenized_candidate_validation = []
+    if candidate_validation_records:
+        tokenized_candidate_validation = prepare_tokenized_dataset(
+            accelerator=accelerator,
+            records=candidate_validation_records,
+            dataset_path=args.candidate_validation_file,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            add_bos_token=args.add_bos_token,
+            cache_dir=cache_dir,
+            overwrite_cache=args.overwrite_cache,
+            dataset_cache_tag="candidate_validation_loss",
+        )
+    tokenized_candidate_test = []
+    if candidate_test_records:
+        tokenized_candidate_test = prepare_tokenized_dataset(
+            accelerator=accelerator,
+            records=candidate_test_records,
+            dataset_path=args.candidate_test_file,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            add_bos_token=args.add_bos_token,
+            cache_dir=cache_dir,
+            overwrite_cache=args.overwrite_cache,
+            dataset_cache_tag="candidate_test_loss",
+        )
     tokenized_validation = []
     if validation_records:
         tokenized_validation = prepare_tokenized_dataset(
@@ -1141,12 +1216,25 @@ def main() -> None:
                 f"seed{args.eval_split_seed}"
             ),
         )
+    tokenized_reference_validation = []
+    if args.reference_evaluator == "loss" and reference_validation_records:
+        tokenized_reference_validation = prepare_tokenized_dataset(
+            accelerator=accelerator,
+            records=reference_validation_records,
+            dataset_path=args.reference_validation_file,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            add_bos_token=args.add_bos_token,
+            cache_dir=cache_dir,
+            overwrite_cache=args.overwrite_cache,
+            dataset_cache_tag="reference_validation_loss",
+        )
     tokenized_reference_eval = []
     if args.reference_evaluator == "loss" and reference_eval_records:
         tokenized_reference_eval = prepare_tokenized_dataset(
             accelerator=accelerator,
             records=reference_eval_records,
-            dataset_path=args.reference_file or f"stereoset_{args.reference_hf_subset}_{args.reference_hf_split}",
+            dataset_path=args.reference_test_file or args.reference_file or f"stereoset_{args.reference_hf_subset}_{args.reference_hf_split}",
             tokenizer=tokenizer,
             max_seq_length=args.max_seq_length,
             add_bos_token=args.add_bos_token,
@@ -1224,6 +1312,22 @@ def main() -> None:
         collate_fn=collator,
         batch_size=args.per_device_train_batch_size,
     )
+    candidate_validation_dataloader = None
+    if tokenized_candidate_validation:
+        candidate_validation_dataloader = DataLoader(
+            tokenized_candidate_validation,
+            shuffle=False,
+            collate_fn=collator,
+            batch_size=args.per_device_eval_batch_size,
+        )
+    candidate_test_dataloader = None
+    if tokenized_candidate_test:
+        candidate_test_dataloader = DataLoader(
+            tokenized_candidate_test,
+            shuffle=False,
+            collate_fn=collator,
+            batch_size=args.per_device_eval_batch_size,
+        )
     validation_dataloader = None
     if tokenized_validation:
         validation_dataloader = DataLoader(
@@ -1236,6 +1340,14 @@ def main() -> None:
     if tokenized_eval:
         eval_dataloader = DataLoader(
             tokenized_eval,
+            shuffle=False,
+            collate_fn=collator,
+            batch_size=args.per_device_eval_batch_size,
+        )
+    reference_validation_dataloader = None
+    if tokenized_reference_validation:
+        reference_validation_dataloader = DataLoader(
+            tokenized_reference_validation,
             shuffle=False,
             collate_fn=collator,
             batch_size=args.per_device_eval_batch_size,
@@ -1275,10 +1387,16 @@ def main() -> None:
         train_dataloader,
         lr_scheduler,
     )
+    if candidate_validation_dataloader is not None:
+        candidate_validation_dataloader = accelerator.prepare(candidate_validation_dataloader)
+    if candidate_test_dataloader is not None:
+        candidate_test_dataloader = accelerator.prepare(candidate_test_dataloader)
     if validation_dataloader is not None:
         validation_dataloader = accelerator.prepare(validation_dataloader)
     if eval_dataloader is not None:
         eval_dataloader = accelerator.prepare(eval_dataloader)
+    if reference_validation_dataloader is not None:
+        reference_validation_dataloader = accelerator.prepare(reference_validation_dataloader)
     if reference_eval_dataloader is not None:
         reference_eval_dataloader = accelerator.prepare(reference_eval_dataloader)
 
@@ -1291,12 +1409,21 @@ def main() -> None:
     summary: dict[str, Any] = {
         "train_examples": len(train_records),
         "effective_train_examples": len(tokenized_train),
+        "candidate_validation_examples": len(candidate_validation_records),
+        "candidate_test_examples": len(candidate_test_records),
+        "effective_candidate_validation_examples": len(tokenized_candidate_validation),
+        "effective_candidate_test_examples": len(tokenized_candidate_test),
         "validation_examples": len(validation_records),
         "evaluation_examples": len(eval_records),
         "ood_evaluation_examples": len(ood_eval_records),
         "effective_validation_examples": len(tokenized_validation),
         "reference_examples": len(reference_records),
+        "reference_validation_examples": len(reference_validation_records),
         "reference_eval_examples": len(reference_eval_records),
+        "reference_test_examples": len(reference_eval_records),
+        "effective_reference_validation_examples": len(tokenized_reference_validation),
+        "effective_reference_eval_examples": len(tokenized_reference_eval),
+        "effective_reference_test_examples": len(tokenized_reference_eval),
         "seed": args.seed,
         "num_warmup_steps": num_warmup_steps,
         "max_steps": max_steps,
@@ -1444,6 +1571,15 @@ def main() -> None:
     final_test_loss = None
     if eval_dataloader is not None:
         final_test_loss = evaluate_validation_loss(model, eval_dataloader, accelerator)
+    candidate_validation_loss = None
+    if candidate_validation_dataloader is not None:
+        candidate_validation_loss = evaluate_validation_loss(model, candidate_validation_dataloader, accelerator)
+    candidate_test_loss = None
+    if candidate_test_dataloader is not None:
+        candidate_test_loss = evaluate_validation_loss(model, candidate_test_dataloader, accelerator)
+    reference_validation_loss = None
+    if reference_validation_dataloader is not None:
+        reference_validation_loss = evaluate_validation_loss(model, reference_validation_dataloader, accelerator)
     reference_eval_loss = None
     if reference_eval_dataloader is not None:
         reference_eval_loss = evaluate_validation_loss(model, reference_eval_dataloader, accelerator)
@@ -1465,7 +1601,14 @@ def main() -> None:
             summary["final_validation_loss"] = final_validation_loss
         if final_test_loss is not None:
             summary["final_test_loss"] = final_test_loss
+        if candidate_validation_loss is not None:
+            summary["candidate_validation_loss"] = candidate_validation_loss
+        if candidate_test_loss is not None:
+            summary["candidate_test_loss"] = candidate_test_loss
+        if reference_validation_loss is not None:
+            summary["reference_validation_loss"] = reference_validation_loss
         if reference_eval_loss is not None:
+            summary["reference_test_loss"] = reference_eval_loss
             summary["reference_eval_loss"] = reference_eval_loss
         if args.skip_final_evaluation:
             summary["final_evaluation_skipped"] = True
@@ -1479,6 +1622,7 @@ def main() -> None:
                 accelerator=accelerator,
                 eval_records=eval_records,
                 ood_eval_records=ood_eval_records,
+                reference_validation_records=reference_validation_records,
                 reference_eval_records=reference_eval_records,
                 final_dir=final_dir,
                 output_dir=output_dir,

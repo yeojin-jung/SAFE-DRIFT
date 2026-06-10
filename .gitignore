@@ -7,7 +7,7 @@ checkpoints/
 wandb/
 data/setting_2_medical/prepared/
 data/setting_3_empathetic/prepared/
-
+experiments/linear-data-selection/outputs/*
 *.pt
 *.pth
 *.bin

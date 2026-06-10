@@ -34,6 +34,11 @@ from baseline_selectors.prismatic_selector import select_prismatic
 from baseline_selectors.random_selector import select_random
 from evaluation import humaneval as humaneval_evaluator
 from evaluation.bias_disentangle import evaluate_base_model as evaluate_base_bias_metrics
+from evaluation.entanglement_analysis import (
+    analyze_entanglement,
+    headline_metrics as entanglement_headline_metrics,
+    selected_indices_from_records,
+)
 from utils.extract_gradients import (
     compute_projected_feature,
     compute_projected_reference_fisher,
@@ -102,6 +107,12 @@ def write_json(records: list[dict[str, Any]], path: Path) -> None:
 
 def write_instruction_jsonl(records: list[dict[str, Any]], path: Path) -> None:
     write_jsonl([to_instruction_output(record) for record in records], path)
+
+
+def count_optional_records(path: str | Path | None) -> int | None:
+    if path is None:
+        return None
+    return len(load_records(path))
 
 
 def selection_count_from_percentage(num_candidates: int, subset_percentage: float) -> int:
@@ -326,6 +337,7 @@ def optional_rank_tag(value: int | float | None, auto_label: str = "auto") -> st
 class SharedSelectorFeatures:
     candidate_features: torch.Tensor
     target_feature: torch.Tensor
+    target_features: torch.Tensor | None
     reference_fisher: torch.Tensor | None
     selector_preconditioner: torch.Tensor | None
     info: dict[str, Any]
@@ -875,6 +887,7 @@ def compute_or_load_shared_selector_features(
         return SharedSelectorFeatures(
             candidate_features=payload["candidate_features"],
             target_feature=payload["target_feature"],
+            target_features=payload.get("target_features"),
             reference_fisher=payload.get("reference_fisher"),
             selector_preconditioner=maybe_load_projected_preconditioner(info),
             info=info,
@@ -961,6 +974,7 @@ def compute_or_load_shared_selector_features(
     return SharedSelectorFeatures(
         candidate_features=candidate_features.cpu(),
         target_feature=target_feature.cpu(),
+        target_features=None if target_features is None else target_features.cpu(),
         reference_fisher=None if reference_fisher is None else reference_fisher.cpu(),
         selector_preconditioner=projected_preconditioner,
         info=metadata,
@@ -987,6 +1001,7 @@ def get_shared_selector_features(
         return SharedSelectorFeatures(
             candidate_features=features.candidate_features,
             target_feature=features.target_feature,
+            target_features=features.target_features,
             reference_fisher=features.reference_fisher,
             selector_preconditioner=features.selector_preconditioner,
             info=info,
@@ -1020,6 +1035,10 @@ def subset_output_path(args: argparse.Namespace, selector_name: str, subset_budg
     return Path(args.selection_output_dir) / filename
 
 
+def selection_metadata_path(subset_path: Path) -> Path:
+    return subset_path.with_suffix(subset_path.suffix + ".selection.json")
+
+
 def load_model_for_selection(args: argparse.Namespace, device: torch.device):
     return load_model_with_lora(
         model_name=args.model_name,
@@ -1033,6 +1052,114 @@ def load_model_for_selection(args: argparse.Namespace, device: torch.device):
 
 def build_subset_records(candidates: list[dict[str, Any]], indices: list[int]) -> list[dict[str, Any]]:
     return [candidates[int(index)] for index in indices]
+
+
+def write_tensor_if_present(tensor: torch.Tensor | None, path: Path) -> str | None:
+    if tensor is None:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(tensor.detach().cpu(), path)
+    return str(path.resolve())
+
+
+def constraint_status(
+    *,
+    cost: float | None,
+    budget: float | None,
+    relative_tolerance: float = 1.0e-5,
+    absolute_tolerance: float = 1.0e-10,
+) -> dict[str, Any]:
+    if cost is None or budget is None:
+        return {
+            "cost": cost,
+            "budget": budget,
+            "satisfied": None,
+            "active": None,
+            "gap": None,
+            "relative_gap": None,
+        }
+    cost = float(cost)
+    budget = float(budget)
+    gap = budget - cost
+    tolerance = max(float(absolute_tolerance), abs(budget) * float(relative_tolerance))
+    return {
+        "cost": cost,
+        "budget": budget,
+        "satisfied": bool(cost <= budget + tolerance),
+        "active": bool(abs(gap) <= tolerance),
+        "gap": float(gap),
+        "relative_gap": float(gap / max(abs(budget), absolute_tolerance)),
+    }
+
+
+def safe_alpha_case(alpha_status: str | None) -> str:
+    if alpha_status == "feasible":
+        return "feasible_rho_and_epsilon_boundaries"
+    if alpha_status == "too_strict":
+        return "rho_budget_too_strict_alpha_min_reference_budget_violated"
+    if alpha_status == "inactive":
+        return "rho_budget_inactive_alpha_max_reference_budget_slack"
+    if alpha_status:
+        return f"alpha_status_{safe_slug(alpha_status)}"
+    return "fixed_alpha_or_unreported"
+
+
+def safe_constraint_report(
+    *,
+    result,
+    rho: float | None,
+    epsilon: float | None,
+) -> dict[str, Any]:
+    norm_budget = None if epsilon is None else 0.5 * float(epsilon) * float(epsilon)
+    reference_budget = None if rho is None else float(rho)
+    safe_update = result.safe_update
+    alpha_status = safe_update.get("alpha_status")
+    alpha_status_text = None if alpha_status is None else str(alpha_status)
+
+    continuous_reference = constraint_status(
+        cost=safe_update.get("reference_cost"),
+        budget=reference_budget,
+    )
+    continuous_norm = constraint_status(
+        cost=safe_update.get("norm_cost"),
+        budget=norm_budget,
+    )
+    selected_reference = constraint_status(
+        cost=result.reference_cost,
+        budget=reference_budget,
+    )
+    selected_norm = constraint_status(
+        cost=result.norm_cost,
+        budget=norm_budget,
+    )
+
+    return {
+        "case": safe_alpha_case(alpha_status_text),
+        "alpha_status": alpha_status_text,
+        "rho": reference_budget,
+        "epsilon": None if epsilon is None else float(epsilon),
+        "norm_budget": norm_budget,
+        "continuous_update": {
+            "reference": continuous_reference,
+            "epsilon_norm": continuous_norm,
+            "predicted_gain": safe_update.get("predicted_gain"),
+            "lambda": safe_update.get("lambda"),
+            "alpha": safe_update.get("alpha"),
+            "beta": safe_update.get("beta"),
+        },
+        "selected_subset": {
+            "reference": selected_reference,
+            "epsilon_norm": selected_norm,
+            "predicted_target_gain": result.predicted_target_gain,
+        },
+        "alpha_boundary": {
+            "target_ratio": safe_update.get("alpha_target_ratio"),
+            "achieved_ratio": safe_update.get("alpha_achieved_ratio"),
+            "phi_min": safe_update.get("alpha_phi_min"),
+            "phi_max": safe_update.get("alpha_phi_max"),
+            "iterations": safe_update.get("alpha_iterations"),
+        },
+    }
 
 
 def ensure_random_subset(
@@ -1168,8 +1295,13 @@ def ensure_safe_subset(
             f"eps{safe_slug(f'{args.safe_epsilon:g}')}"
         )
     output_path = subset_output_path(args, selector_tag, subset_budget)
-    if output_path.exists() and not args.overwrite_subsets:
-        return output_path, {"selector": selector_tag, "cache_hit": True, "selection_wallclock_seconds": 0.0}
+    metadata_path = selection_metadata_path(output_path)
+    output_exists = output_path.exists()
+    if output_exists and not args.overwrite_subsets and metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["cache_hit"] = True
+        metadata["selection_wallclock_seconds"] = 0.0
+        return output_path, metadata
     if not references:
         raise ValueError("safe selector requires reference samples from --reference-file or --reference-hf-stereoset.")
 
@@ -1195,10 +1327,16 @@ def ensure_safe_subset(
         preconditioner=selector_update_preconditioner(args, features),
     )
     wallclock = time.perf_counter() - start
-    write_jsonl(result.selected_candidates, output_path)
-    return output_path, {
+    if args.overwrite_subsets or not output_exists:
+        write_jsonl(result.selected_candidates, output_path)
+    constraint_report = safe_constraint_report(
+        result=result,
+        rho=args.safe_cost_c,
+        epsilon=args.safe_epsilon,
+    )
+    selection_info = {
         "selector": selector_tag,
-        "cache_hit": False,
+        "cache_hit": bool(output_exists and not args.overwrite_subsets),
         "selection_wallclock_seconds": wallclock,
         "safe_geometry": result.geometry,
         "safe_solver": result.solver,
@@ -1216,8 +1354,227 @@ def ensure_safe_subset(
         "safe_alpha_status": result.safe_update.get("alpha_status"),
         "safe_alpha_target_ratio": result.safe_update.get("alpha_target_ratio"),
         "safe_alpha_achieved_ratio": result.safe_update.get("alpha_achieved_ratio"),
+        "safe_alpha_phi_min": result.safe_update.get("alpha_phi_min"),
+        "safe_alpha_phi_max": result.safe_update.get("alpha_phi_max"),
+        "safe_alpha_iterations": result.safe_update.get("alpha_iterations"),
+        "safe_constraint_case": constraint_report["case"],
+        "safe_continuous_reference_budget_satisfied": constraint_report["continuous_update"]["reference"]["satisfied"],
+        "safe_continuous_reference_budget_active": constraint_report["continuous_update"]["reference"]["active"],
+        "safe_continuous_reference_budget_gap": constraint_report["continuous_update"]["reference"]["gap"],
+        "safe_continuous_epsilon_budget_satisfied": constraint_report["continuous_update"]["epsilon_norm"]["satisfied"],
+        "safe_continuous_epsilon_budget_active": constraint_report["continuous_update"]["epsilon_norm"]["active"],
+        "safe_continuous_epsilon_budget_gap": constraint_report["continuous_update"]["epsilon_norm"]["gap"],
+        "safe_selected_reference_budget_satisfied": constraint_report["selected_subset"]["reference"]["satisfied"],
+        "safe_selected_reference_budget_active": constraint_report["selected_subset"]["reference"]["active"],
+        "safe_selected_reference_budget_gap": constraint_report["selected_subset"]["reference"]["gap"],
+        "safe_selected_epsilon_budget_satisfied": constraint_report["selected_subset"]["epsilon_norm"]["satisfied"],
+        "safe_selected_epsilon_budget_active": constraint_report["selected_subset"]["epsilon_norm"]["active"],
+        "safe_selected_epsilon_budget_gap": constraint_report["selected_subset"]["epsilon_norm"]["gap"],
+        "safe_constraint_report": constraint_report,
         **features.info,
     }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(selection_info, indent=2, ensure_ascii=False), encoding="utf-8")
+    return output_path, selection_info
+
+
+def save_selected_artifacts_for_run(
+    *,
+    args: argparse.Namespace,
+    candidates: list[dict[str, Any]],
+    targets: list[dict[str, Any]],
+    references: list[dict[str, Any]],
+    train_file: str | Path,
+    run_output_dir: Path,
+    selector: str,
+    method_tag: str,
+    selection_info: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not args.save_selected_artifacts:
+        return None
+    if args.dry_run:
+        return {"enabled": True, "skipped": True, "reason": "dry_run"}
+
+    if selector == "full":
+        selected_indices = list(range(len(candidates)))
+        selected_records = list(candidates)
+    else:
+        selected_records = load_records(train_file)
+        selected_indices = selected_indices_from_records(candidates, selected_records)
+
+    artifact_dir = run_output_dir / "selection_artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    selected_candidates_path = artifact_dir / "selected_candidates.jsonl"
+    write_jsonl(selected_records, selected_candidates_path)
+
+    selected_indices_path = artifact_dir / "selected_candidate_indices.json"
+    selected_indices_path.write_text(
+        json.dumps(
+            {
+                "selector": selector,
+                "method_tag": method_tag,
+                "train_file": str(Path(train_file).resolve()),
+                "candidate_file": str(Path(args.candidate_file).resolve()),
+                "indices": [int(index) for index in selected_indices],
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    info: dict[str, Any] = {
+        "enabled": True,
+        "skipped": False,
+        "artifact_dir": str(artifact_dir.resolve()),
+        "selected_candidates_file": str(selected_candidates_path.resolve()),
+        "selected_candidate_indices_file": str(selected_indices_path.resolve()),
+        "selected_count": len(selected_indices),
+        "candidate_count": len(candidates),
+        "feature_cache_path": selection_info.get("selector_feature_cache_path"),
+        "selector_feature_method": args.selector_feature_method,
+        "selector_preconditioner": args.selector_preconditioner,
+    }
+
+    if references:
+        features = get_shared_selector_features(args, candidates, targets, references)
+        selected_tensor = torch.tensor(selected_indices, dtype=torch.long)
+        selected_features = features.candidate_features[selected_tensor].detach().cpu()
+        selected_features_path = artifact_dir / "selected_candidate_features.pt"
+        torch.save(selected_features, selected_features_path)
+        selected_gradients_path = artifact_dir / "selected_candidate_gradients.pt"
+        torch.save(selected_features, selected_gradients_path)
+
+        info.update(
+            {
+                "selected_candidate_features_file": str(selected_features_path.resolve()),
+                "selected_candidate_gradients_file": str(selected_gradients_path.resolve()),
+                "selected_candidate_features_shape": tuple(selected_features.shape),
+                "target_feature_file": write_tensor_if_present(features.target_feature, artifact_dir / "target_feature.pt"),
+                "target_features_file": write_tensor_if_present(features.target_features, artifact_dir / "target_features.pt"),
+                "reference_fisher_file": write_tensor_if_present(features.reference_fisher, artifact_dir / "reference_fisher.pt"),
+                "selector_preconditioner_file": write_tensor_if_present(
+                    features.selector_preconditioner,
+                    artifact_dir / "selector_preconditioner.pt",
+                ),
+                "feature_cache_path": features.info.get("selector_feature_cache_path"),
+                "selector_feature_dim": features.info.get("selector_feature_dim"),
+                "reference_fisher_shape": features.info.get("reference_fisher_shape"),
+            }
+        )
+        metadata_path = artifact_dir / "selector_feature_metadata.json"
+        metadata_path.write_text(json.dumps(features.info, indent=2, ensure_ascii=False), encoding="utf-8")
+        info["selector_feature_metadata_file"] = str(metadata_path.resolve())
+    else:
+        info.update(
+            {
+                "selected_candidate_features_file": None,
+                "selected_candidate_gradients_file": None,
+                "reason": "no reference records available to build selector feature cache",
+            }
+        )
+    return info
+
+
+def compute_entanglement_for_run(
+    *,
+    args: argparse.Namespace,
+    candidates: list[dict[str, Any]],
+    targets: list[dict[str, Any]],
+    references: list[dict[str, Any]],
+    train_file: str | Path,
+    run_output_dir: Path,
+    selector: str,
+    method_tag: str,
+) -> dict[str, Any] | None:
+    if not args.compute_entanglement_metrics:
+        return None
+    if args.dry_run:
+        return {
+            "enabled": True,
+            "skipped": True,
+            "reason": "dry_run",
+        }
+    if args.selector_feature_method != "low_rank":
+        return {
+            "enabled": False,
+            "skipped": True,
+            "reason": "entanglement metrics require selector_feature_method=low_rank",
+        }
+    if not references:
+        return {
+            "enabled": False,
+            "skipped": True,
+            "reason": "entanglement metrics require reference records",
+        }
+
+    features = get_shared_selector_features(args, candidates, targets, references)
+    if features.reference_fisher is None:
+        return {
+            "enabled": False,
+            "skipped": True,
+            "reason": "shared selector features do not include reference_fisher",
+        }
+
+    if selector == "full":
+        selected_indices = list(range(len(candidates)))
+    else:
+        selected_records = load_records(train_file)
+        selected_indices = selected_indices_from_records(candidates, selected_records)
+
+    out_dir = run_output_dir / "entanglement"
+    summary = analyze_entanglement(
+        candidate_features=features.candidate_features,
+        target_feature=features.target_feature,
+        target_features=features.target_features,
+        reference_fisher=features.reference_fisher,
+        selector_preconditioner=features.selector_preconditioner,
+        selected_indices=selected_indices,
+        output_dir=out_dir,
+        metadata=features.info,
+        reference_rank=features.info.get("low_rank_resolved_reference_rank"),
+        target_sample_size=args.entanglement_target_sample_size,
+        seed=args.seed,
+        selected_csv_max_rows=args.entanglement_selected_csv_max_rows,
+        label=method_tag,
+    )
+    info = {
+        "enabled": True,
+        "skipped": False,
+        **entanglement_headline_metrics(summary),
+    }
+    return info
+
+
+def merge_entanglement_into_training_summary(run_output_dir: Path, entanglement_info: dict[str, Any] | None) -> None:
+    if not entanglement_info:
+        return
+    summary_path = run_output_dir / "summary.json"
+    if not summary_path.exists():
+        return
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    summary["entanglement"] = entanglement_info
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def merge_selection_artifacts_into_training_summary(
+    run_output_dir: Path,
+    selection_artifacts: dict[str, Any] | None,
+) -> None:
+    if not selection_artifacts:
+        return
+    summary_path = run_output_dir / "summary.json"
+    if not summary_path.exists():
+        return
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    summary["selection_artifacts"] = selection_artifacts
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def build_train_command(args: argparse.Namespace, train_file: str | Path, run_output_dir: Path) -> list[str]:
@@ -1325,6 +1682,14 @@ def build_train_command(args: argparse.Namespace, train_file: str | Path, run_ou
         command.extend(["--ood-evaluator", args.ood_evaluator])
     if args.reference_evaluator is not None:
         command.extend(["--reference-evaluator", args.reference_evaluator])
+    if args.candidate_validation_file is not None:
+        command.extend(["--candidate-validation-file", str(args.candidate_validation_file)])
+    if args.candidate_test_file is not None:
+        command.extend(["--candidate-test-file", str(args.candidate_test_file)])
+    if args.reference_validation_file is not None:
+        command.extend(["--reference-validation-file", str(args.reference_validation_file)])
+    if args.reference_test_file is not None:
+        command.extend(["--reference-test-file", str(args.reference_test_file)])
     if args.benchmark_evals:
         command.extend(["--benchmark-evals", *list(args.benchmark_evals)])
     if args.eval_max_examples is not None:
@@ -1672,6 +2037,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional flat YAML defaults loaded before --config.",
     )
     parser.add_argument("--candidate-file", default=str(DEFAULT_CANDIDATE_FILE))
+    parser.add_argument("--candidate-validation-file", default=None)
+    parser.add_argument("--candidate-test-file", default=None)
     parser.add_argument("--target-file", default=str(DEFAULT_TARGET_FILE))
     parser.add_argument(
         "--validation-file",
@@ -1687,6 +2054,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-split-proportions", nargs=3, type=float, default=[0.34, 0.33, 0.33])
     parser.add_argument("--target-split-seed", type=int, default=42)
     parser.add_argument("--reference-file", default=None)
+    parser.add_argument("--reference-validation-file", default=None)
+    parser.add_argument("--reference-test-file", default=None)
     parser.add_argument("--reference-hf-stereoset", action="store_true")
     parser.add_argument("--reference-hf-subset", default="intrasentence")
     parser.add_argument("--reference-hf-split", default="validation")
@@ -1721,6 +2090,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-shared-selector-cache-only", action="store_true")
     parser.add_argument("--skip-training", action="store_true")
     parser.add_argument("--skip-final-evaluation", action="store_true")
+    parser.add_argument("--save-selected-artifacts", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--selection-output-dir", default=str(DEFAULT_OUTPUT_DIR / "subsets"))
@@ -1826,6 +2196,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compute-validation-gradient", action="store_true")
     parser.add_argument("--validation-gradient-max-examples", type=int, default=128)
     parser.add_argument("--compute-reference-fisher", action="store_true")
+    parser.add_argument("--compute-entanglement-metrics", action="store_true")
+    parser.add_argument("--entanglement-target-sample-size", type=int, default=128)
+    parser.add_argument("--entanglement-selected-csv-max-rows", type=int, default=5000)
     parser.add_argument("--bias-eval-domain", default="all")
     parser.add_argument("--bias-eval-layers", default="-1")
     parser.add_argument("--bias-eval-alpha", type=float, default=0.5)
@@ -1943,6 +2316,10 @@ def main() -> None:
         "candidate_file": str(Path(args.candidate_file).resolve()),
         "raw_candidate_count": len(raw_candidates),
         "candidate_pool": candidate_split_info,
+        "candidate_validation_file": None if args.candidate_validation_file is None else str(Path(args.candidate_validation_file).resolve()),
+        "candidate_validation_count": count_optional_records(args.candidate_validation_file),
+        "candidate_test_file": None if args.candidate_test_file is None else str(Path(args.candidate_test_file).resolve()),
+        "candidate_test_count": count_optional_records(args.candidate_test_file),
         "target_file": str(Path(args.target_file).resolve()),
         "validation_file": None if args.validation_file is None else str(Path(args.validation_file).resolve()),
         "eval_file": None if args.eval_file is None else str(Path(args.eval_file).resolve()),
@@ -1951,6 +2328,10 @@ def main() -> None:
         "target_split_seed": args.target_split_seed,
         "target_split_sizes": {name: len(split) for name, split in target_splits.items()},
         "reference_file": None if args.reference_file is None else str(Path(args.reference_file).resolve()),
+        "reference_validation_file": None if args.reference_validation_file is None else str(Path(args.reference_validation_file).resolve()),
+        "reference_validation_count": count_optional_records(args.reference_validation_file),
+        "reference_test_file": None if args.reference_test_file is None else str(Path(args.reference_test_file).resolve()),
+        "reference_test_count": count_optional_records(args.reference_test_file),
         "bias_eval_file": None if args.bias_eval_file is None else str(Path(args.bias_eval_file).resolve()),
         "reference_source": reference_source,
         "reference_hf_stereoset": bool(args.reference_hf_stereoset),
@@ -1989,6 +2370,10 @@ def main() -> None:
         "low_rank_delta_task": args.low_rank_delta_task,
         "low_rank_max_task_rank": args.low_rank_max_task_rank,
         "low_rank_target_max_examples": args.low_rank_target_max_examples,
+        "save_selected_artifacts": bool(args.save_selected_artifacts),
+        "compute_entanglement_metrics": bool(args.compute_entanglement_metrics),
+        "entanglement_target_sample_size": args.entanglement_target_sample_size,
+        "entanglement_selected_csv_max_rows": args.entanglement_selected_csv_max_rows,
         "base_model_eval": base_model_eval,
         "runs": [],
     }
@@ -2045,11 +2430,34 @@ def main() -> None:
                 f"[selection] selector={selector} method_tag={method_tag} "
                 f"train_file={train_file} output_dir={run_output_dir}"
             )
+            selection_artifacts = save_selected_artifacts_for_run(
+                args=args,
+                candidates=candidates,
+                targets=targets,
+                references=references,
+                train_file=train_file,
+                run_output_dir=run_output_dir,
+                selector=selector,
+                method_tag=method_tag,
+                selection_info=selection_info,
+            )
+            entanglement_info = compute_entanglement_for_run(
+                args=args,
+                candidates=candidates,
+                targets=targets,
+                references=references,
+                train_file=train_file,
+                run_output_dir=run_output_dir,
+                selector=selector,
+                method_tag=method_tag,
+            )
             command = build_train_command(args, train_file=train_file, run_output_dir=run_output_dir)
             train_seconds = 0.0
             return_code = 0
             if not args.skip_training:
                 train_seconds, return_code = run_training_command(command, dry_run=args.dry_run)
+            merge_selection_artifacts_into_training_summary(run_output_dir, selection_artifacts)
+            merge_entanglement_into_training_summary(run_output_dir, entanglement_info)
 
             manifest["runs"].append(
                 {
@@ -2060,6 +2468,8 @@ def main() -> None:
                     "train_file": str(train_file),
                     "run_output_dir": str(run_output_dir),
                     "selection": selection_info,
+                    "selection_artifacts": selection_artifacts,
+                    "entanglement": entanglement_info,
                     "train_command": command,
                     "train_wallclock_seconds": train_seconds,
                     "train_return_code": return_code,

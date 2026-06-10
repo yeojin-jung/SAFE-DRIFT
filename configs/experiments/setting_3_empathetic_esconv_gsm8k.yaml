@@ -9,41 +9,141 @@ prepare:
       - --out
       - data/setting_3_empathetic/prepared
       - --target-splits
-      - validation,test
+      - train,validation,test
       - --max-target-train
-      - "34"
+      - "100"
       - --max-candidates
-      - "5000"
+      - "0"
+      - --max-candidate-validation
+      - "512"
+      - --max-candidate-test
+      - "512"
       - --max-target-eval
-      - "66"
+      - "0"
       - --max-reference-examples
-      - "258"
+      - "256"
+      - --max-reference-validation-examples
+      - "128"
+      - --max-reference-test-examples
+      - "128"
       - --overwrite
 
 data:
   candidate_file: data/setting_3_empathetic/prepared/candidate_pool.jsonl
+  candidate_validation_file: data/setting_3_empathetic/prepared/candidate_validation.jsonl
+  candidate_test_file: data/setting_3_empathetic/prepared/candidate_test.jsonl
   target_file: data/setting_3_empathetic/prepared/target_all.jsonl
-  ood_eval_file: data/setting_3_empathetic/prepared/reference_eval/gsm8k.jsonl
-  reference_file: data/setting_3_empathetic/prepared/reference_eval/gsm8k.jsonl
+  ood_eval_file: data/setting_3_empathetic/prepared/reference_eval/gsm8k_test.jsonl
+  reference_file: data/setting_3_empathetic/prepared/reference_prompts.jsonl
+  reference_validation_file: data/setting_3_empathetic/prepared/reference_validation.jsonl
+  reference_test_file: data/setting_3_empathetic/prepared/reference_test.jsonl
 
 model_variants:
-  - name: olmo7b_gradient_equals_ft
-    gradient_model: allenai/OLMo-2-1124-7B
-    finetune_model: allenai/OLMo-2-1124-7B
-    enabled: true
-  - name: olmo7b_to_instruct_transfer
-    gradient_model: allenai/OLMo-2-1124-7B
+  - name: olmo7b_instruct_gradient_equals_ft
+    gradient_model: allenai/OLMo-2-1124-7B-Instruct
     finetune_model: allenai/OLMo-2-1124-7B-Instruct
     enabled: true
+  - name: olmo7b_base_to_instruct_transfer
+    gradient_model: allenai/OLMo-2-1124-7B
+    finetune_model: allenai/OLMo-2-1124-7B-Instruct
+    enabled: false
+
+baseline_selectors: ["random", "dsir", "less", "prismatic"]
+subset_percentages: [5.0]
+
+splits:
+  target: [100.0, 8741.0, 8742.0]
+  reference: [1.0, 0.0]
+
+selection:
+  selector_feature_method: low_rank
+  selector_preconditioner: adam
+  save_selected_artifacts: true
+  selection_torch_dtype: bf16
+  max_seq_len: 1024
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  reference_fisher_max_examples: 128
+  validation_gradient_max_examples: 128
+  low_rank_target_max_examples: 100
+  low_rank_candidate_max_examples: 512
+  low_rank_candidate_projection_chunk_rows: 128
+  safe_geometry: reference
+  safe_solver: greedy_marginal
+  safe_learning_rate: 2.0e-4
+  compute_validation_gradient: true
+  compute_reference_fisher: true
+
+rank_grid:
+  - name: KR64_KT16
+    K_R: 64
+    K_T: 16
+    K: 80
+
+safe:
+  epsilon: 1.0
+  epsilon_values: [1.0, 1.0e-4]
+  rho_values: [1.0e-8, 1.0e-6, 1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0, 100.0]
+  variants:
+    - name: safe_reference_precondadam
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+    - name: safe_reference_precondsgd
+      selector_feature_method: low_rank
+      selector_preconditioner: sgd
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+    - name: safe_euclidean_precondadam
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      safe_geometry: euclidean
+      safe_solver: greedy_marginal
+    - name: safe_euclidean_precondsgd
+      selector_feature_method: low_rank
+      selector_preconditioner: sgd
+      safe_geometry: euclidean
+      safe_solver: greedy_marginal
+    - name: safe_rank_precondadam
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      safe_geometry: reference
+      safe_solver: rank
+    - name: safe_rank_precondsgd
+      selector_feature_method: low_rank
+      selector_preconditioner: sgd
+      safe_geometry: reference
+      safe_solver: rank
+    - name: safe_random_sketch_precondadam
+      selector_feature_method: random_sketch
+      selector_preconditioner: adam
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+    - name: safe_random_sketch_precondsgd
+      selector_feature_method: random_sketch
+      selector_preconditioner: sgd
+      safe_geometry: reference
+      safe_solver: greedy_marginal
 
 training:
   train_lora_r: 16
-  train_lora_alpha: 16
-  train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  train_lora_alpha: 32
+  train_torch_dtype: bf16
+  train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  num_train_epochs: 2.0
+  save_steps: 25
+  eval_steps: 25
 
 evaluation:
   evaluator: esconv
   ood_evaluator: none
   reference_evaluator: gsm8k
+  compute_entanglement_metrics: true
+  entanglement_target_sample_size: 128
+  entanglement_selected_csv_max_rows: 5000
   benchmark_evals: ["gsm8k"]
-  benchmark_max_examples: 258
+  benchmark_max_examples: 128
+  eval_max_examples: 128

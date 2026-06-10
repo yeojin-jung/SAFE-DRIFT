@@ -43,8 +43,12 @@ class BuildConfig:
     seed: int
     max_target_train: int
     max_candidates: int
+    max_candidate_validation: int
+    max_candidate_test: int
     max_target_eval: int
     max_reference_examples: int
+    max_reference_validation_examples: int
+    max_reference_test_examples: int
     target_splits: list[str]
     overwrite: bool
 
@@ -163,6 +167,29 @@ def sample_records(records: Sequence[dict[str, Any]], max_count: int, seed: int)
     indices = list(range(len(records)))
     random.Random(seed).shuffle(indices)
     return [records[index] for index in indices[:max_count]]
+
+
+def split_primary_validation_test(
+    records: Sequence[dict[str, Any]],
+    *,
+    primary_count: int,
+    validation_count: int,
+    test_count: int,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    records = [record for record in records if record is not None]
+    indices = list(range(len(records)))
+    random.Random(seed).shuffle(indices)
+    ordered = [records[index] for index in indices]
+    validation_count = max(0, int(validation_count))
+    test_count = max(0, int(test_count))
+    if primary_count <= 0:
+        primary_count = max(0, len(ordered) - validation_count - test_count)
+    primary_count = max(0, int(primary_count))
+    primary = ordered[:primary_count]
+    validation = ordered[primary_count : primary_count + validation_count]
+    test = ordered[primary_count + validation_count : primary_count + validation_count + test_count]
+    return primary, validation, test
 
 
 def unique_records(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -361,18 +388,45 @@ def build_dataset(out_dir: Path, config: BuildConfig) -> dict[str, int]:
 
     print("[candidate] formatting Empathetic Dialogues split=train ...", file=sys.stderr)
     candidate_records = unique_records(format_empathetic_dialogues("train"))
-    candidates = sample_records(candidate_records, config.max_candidates, config.seed + 3)
+    candidates, candidate_validation, candidate_test = split_primary_validation_test(
+        candidate_records,
+        primary_count=config.max_candidates,
+        validation_count=config.max_candidate_validation,
+        test_count=config.max_candidate_test,
+        seed=config.seed + 3,
+    )
 
     print("[reference] formatting GSM8K ...", file=sys.stderr)
-    references = format_gsm8k(config.max_reference_examples, config.seed + stable_int("gsm8k"))
+    reference_total = (
+        int(config.max_reference_examples)
+        + int(config.max_reference_validation_examples)
+        + int(config.max_reference_test_examples)
+    )
+    references = format_gsm8k(reference_total, config.seed + stable_int("gsm8k"))
+    reference_fit, reference_validation, reference_test = split_primary_validation_test(
+        references,
+        primary_count=config.max_reference_examples,
+        validation_count=config.max_reference_validation_examples,
+        test_count=config.max_reference_test_examples,
+        seed=config.seed + stable_int("gsm8k:reference_split"),
+    )
 
     counts = {
         "target_all": write_jsonl(out_dir / "target_all.jsonl", target_all),
         "target_train": write_jsonl(out_dir / "target_train.jsonl", target_train),
         "target_eval": write_jsonl(out_dir / "target_eval.jsonl", target_eval),
         "candidate_pool": write_jsonl(out_dir / "candidate_pool.jsonl", candidates),
-        "reference_eval/gsm8k": write_jsonl(out_dir / "reference_eval" / "gsm8k.jsonl", references),
-        "reference_prompts": write_jsonl(out_dir / "reference_prompts.jsonl", references),
+        "candidate_validation": write_jsonl(out_dir / "candidate_validation.jsonl", candidate_validation),
+        "candidate_test": write_jsonl(out_dir / "candidate_test.jsonl", candidate_test),
+        "reference_eval/gsm8k_validation": write_jsonl(
+            out_dir / "reference_eval" / "gsm8k_validation.jsonl",
+            reference_validation,
+        ),
+        "reference_eval/gsm8k_test": write_jsonl(out_dir / "reference_eval" / "gsm8k_test.jsonl", reference_test),
+        "reference_eval/gsm8k": write_jsonl(out_dir / "reference_eval" / "gsm8k.jsonl", reference_test),
+        "reference_prompts": write_jsonl(out_dir / "reference_prompts.jsonl", reference_fit),
+        "reference_validation": write_jsonl(out_dir / "reference_validation.jsonl", reference_validation),
+        "reference_test": write_jsonl(out_dir / "reference_test.jsonl", reference_test),
     }
     return counts
 
@@ -387,8 +441,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-target-train", type=int, default=34)
     parser.add_argument("--max-candidates", type=int, default=5000)
+    parser.add_argument("--max-candidate-validation", type=int, default=0)
+    parser.add_argument("--max-candidate-test", type=int, default=0)
     parser.add_argument("--max-target-eval", type=int, default=66)
     parser.add_argument("--max-reference-examples", type=int, default=258)
+    parser.add_argument("--max-reference-validation-examples", type=int, default=0)
+    parser.add_argument("--max-reference-test-examples", type=int, default=0)
     parser.add_argument("--target-splits", default="validation,test")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
@@ -406,8 +464,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         max_target_train=args.max_target_train,
         max_candidates=args.max_candidates,
+        max_candidate_validation=args.max_candidate_validation,
+        max_candidate_test=args.max_candidate_test,
         max_target_eval=args.max_target_eval,
         max_reference_examples=args.max_reference_examples,
+        max_reference_validation_examples=args.max_reference_validation_examples,
+        max_reference_test_examples=args.max_reference_test_examples,
         target_splits=parse_csv_list(args.target_splits),
         overwrite=bool(args.overwrite),
     )
@@ -423,7 +485,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema": {
             "target_file": "target_all.jsonl",
             "candidate_pool_file": "candidate_pool.jsonl",
+            "candidate_validation_file": "candidate_validation.jsonl",
+            "candidate_test_file": "candidate_test.jsonl",
             "reference_prompt_file": "reference_prompts.jsonl",
+            "reference_validation_file": "reference_validation.jsonl",
+            "reference_test_file": "reference_test.jsonl",
             "reference_eval_file": "reference_eval/gsm8k.jsonl",
         },
     }

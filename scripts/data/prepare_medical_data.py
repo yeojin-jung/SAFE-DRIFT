@@ -3,10 +3,13 @@
 Build a MedQA-target / MedMCQA-candidate real-data experiment for SAFE selection.
 
 Output layout:
-  - target_all.jsonl: small gold MedQA train subset used by the pipeline
+  - target_train.jsonl: small gold MedQA train subset used for target gradients
+  - target_dev.jsonl: full MedQA dev split for model selection / development
+  - target_test.jsonl: full MedQA test split for final reporting
   - candidate_pool.jsonl: candidate pool from MedMCQA train or MedQA-train remainder
   - reference_prompts.jsonl: labeled off-target records suitable for reference Fisher
-  - reference_eval/mcq_ood_eval.jsonl: multiple-choice off-target eval bundle
+  - reference_eval/*.jsonl: benchmark-specific labeled or prompt-only eval files
+  - reference_eval/mcq_ood_test.jsonl: held-out multiple-choice off-target test bundle
   - manifest.json: experiment metadata and counts
 """
 from __future__ import annotations
@@ -78,7 +81,11 @@ class BuildConfig:
     seed: int
     max_target_train: int
     max_candidates: int
+    max_candidate_validation: int
+    max_candidate_test: int
     max_reference_per_dataset: int
+    max_reference_validation_per_dataset: int
+    max_reference_test_per_dataset: int
     reference_fisher_max_total: int | None
     reference_datasets: list[str]
     candidate_source: str
@@ -141,6 +148,29 @@ def sample_records(records: Sequence[dict[str, Any]], max_count: int, seed: int)
     indices = list(range(len(records)))
     rng.shuffle(indices)
     return [records[index] for index in indices[:max_count]]
+
+
+def split_primary_validation_test(
+    records: Sequence[dict[str, Any]],
+    *,
+    primary_count: int,
+    validation_count: int,
+    test_count: int,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    records = [record for record in records if record is not None]
+    indices = list(range(len(records)))
+    random.Random(seed).shuffle(indices)
+    ordered = [records[index] for index in indices]
+    validation_count = max(0, int(validation_count))
+    test_count = max(0, int(test_count))
+    if primary_count <= 0:
+        primary_count = max(0, len(ordered) - validation_count - test_count)
+    primary_count = max(0, int(primary_count))
+    primary = ordered[:primary_count]
+    validation = ordered[primary_count : primary_count + validation_count]
+    test = ordered[primary_count + validation_count : primary_count + validation_count + test_count]
+    return primary, validation, test
 
 
 def choice_labels(num_choices: int) -> list[str]:
@@ -482,19 +512,45 @@ def build_reference_artifacts(out_dir: Path, config: BuildConfig) -> dict[str, i
     eval_dir.mkdir(parents=True, exist_ok=True)
     counts: dict[str, int] = {}
     fisher_records: list[dict[str, Any]] = []
-    mcq_ood_records: list[dict[str, Any]] = []
+    reference_validation_records: list[dict[str, Any]] = []
+    reference_test_records: list[dict[str, Any]] = []
+    mcq_ood_validation_records: list[dict[str, Any]] = []
+    mcq_ood_test_records: list[dict[str, Any]] = []
 
     for name in config.reference_datasets:
         if name not in builders:
             raise ValueError(f"Unknown reference dataset {name!r}. Choose from {sorted(builders)}.")
         print(f"[reference] formatting {name} ...", file=sys.stderr)
-        records = builders[name](config.max_reference_per_dataset, config.seed + stable_int(name))
-        counts[f"reference_source/{name}"] = len(records)
+        total_count = (
+            int(config.max_reference_per_dataset)
+            + int(config.max_reference_validation_per_dataset)
+            + int(config.max_reference_test_per_dataset)
+        )
+        records = builders[name](total_count, config.seed + stable_int(name))
+        reference_fit, reference_validation, reference_test = split_primary_validation_test(
+            records,
+            primary_count=config.max_reference_per_dataset,
+            validation_count=config.max_reference_validation_per_dataset,
+            test_count=config.max_reference_test_per_dataset,
+            seed=config.seed + stable_int(f"{name}:reference_split"),
+        )
+        counts[f"reference_source/{name}/fit"] = len(reference_fit)
+        counts[f"reference_source/{name}/validation"] = write_jsonl(
+            eval_dir / f"{name}_validation.jsonl",
+            reference_validation,
+        )
+        counts[f"reference_source/{name}/test"] = write_jsonl(eval_dir / f"{name}_test.jsonl", reference_test)
+        counts[f"reference_eval/{name}"] = write_jsonl(eval_dir / f"{name}.jsonl", reference_test)
         if name in {"mmlu_non_medical", "bbq"}:
-            mcq_ood_records.extend(records)
+            mcq_ood_validation_records.extend(reference_validation)
+            mcq_ood_test_records.extend(reference_test)
         if name == "ifeval":
+            reference_validation_records.extend(reference_validation)
+            reference_test_records.extend(reference_test)
             continue
-        fisher_records.extend([record for record in records if has_supervised_target(record)])
+        fisher_records.extend([record for record in reference_fit if has_supervised_target(record)])
+        reference_validation_records.extend([record for record in reference_validation if has_supervised_target(record)])
+        reference_test_records.extend([record for record in reference_test if has_supervised_target(record)])
 
     supervised_fisher_pool = list(fisher_records)
     if config.reference_fisher_max_total is not None:
@@ -506,7 +562,14 @@ def build_reference_artifacts(out_dir: Path, config: BuildConfig) -> dict[str, i
 
     counts["reference_prompt_supervised_pool"] = len(supervised_fisher_pool)
     counts["reference_prompts"] = write_jsonl(out_dir / "reference_prompts.jsonl", fisher_records)
-    counts["reference_eval/mcq_ood_eval"] = write_jsonl(eval_dir / "mcq_ood_eval.jsonl", mcq_ood_records)
+    counts["reference_validation"] = write_jsonl(out_dir / "reference_validation.jsonl", reference_validation_records)
+    counts["reference_test"] = write_jsonl(out_dir / "reference_test.jsonl", reference_test_records)
+    counts["reference_eval/mcq_ood_validation"] = write_jsonl(
+        eval_dir / "mcq_ood_validation.jsonl",
+        mcq_ood_validation_records,
+    )
+    counts["reference_eval/mcq_ood_test"] = write_jsonl(eval_dir / "mcq_ood_test.jsonl", mcq_ood_test_records)
+    counts["reference_eval/mcq_ood_eval"] = write_jsonl(eval_dir / "mcq_ood_eval.jsonl", mcq_ood_test_records)
     return counts
 
 
@@ -516,20 +579,33 @@ def build_medical_dataset(out_dir: Path, config: BuildConfig) -> dict[str, int]:
     target_train = sample_records(medqa_train_all, config.max_target_train, config.seed + 1)
     target_train_ids = {record["id"] for record in target_train}
 
+    print("[medical] loading MedQA dev/test ...", file=sys.stderr)
+    target_dev = format_medqa_split("dev", role="target_eval_dev")
+    target_test = format_medqa_split("test", role="target_eval_test")
+
     if config.candidate_source == "medmcqa":
         print("[medical] loading MedMCQA train candidates ...", file=sys.stderr)
         candidate_records = format_medmcqa_train()
-        candidates = sample_records(candidate_records, config.max_candidates, config.seed + 2)
     elif config.candidate_source == "medqa_train_remainder":
         print("[medical] sampling MedQA train remainder as candidates ...", file=sys.stderr)
         candidate_records = [record for record in medqa_train_all if record["id"] not in target_train_ids]
-        candidates = sample_records(candidate_records, config.max_candidates, config.seed + 2)
     else:
         raise ValueError(f"Unsupported candidate_source: {config.candidate_source}")
+    candidates, candidate_validation, candidate_test = split_primary_validation_test(
+        candidate_records,
+        primary_count=config.max_candidates,
+        validation_count=config.max_candidate_validation,
+        test_count=config.max_candidate_test,
+        seed=config.seed + 2,
+    )
 
     counts = {
-        "target_all": write_jsonl(out_dir / "target_all.jsonl", target_train),
+        "target_train": write_jsonl(out_dir / "target_train.jsonl", target_train),
+        "target_dev": write_jsonl(out_dir / "target_dev.jsonl", target_dev),
+        "target_test": write_jsonl(out_dir / "target_test.jsonl", target_test),
         "candidate_pool": write_jsonl(out_dir / "candidate_pool.jsonl", candidates),
+        "candidate_validation": write_jsonl(out_dir / "candidate_validation.jsonl", candidate_validation),
+        "candidate_test": write_jsonl(out_dir / "candidate_test.jsonl", candidate_test),
     }
     return counts
 
@@ -542,7 +618,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--max-target-train", type=int, default=256)
     parser.add_argument("--max-candidates", type=int, default=2000)
+    parser.add_argument("--max-candidate-validation", type=int, default=0)
+    parser.add_argument("--max-candidate-test", type=int, default=0)
     parser.add_argument("--max-reference-per-dataset", type=int, default=256)
+    parser.add_argument("--max-reference-validation-per-dataset", type=int, default=0)
+    parser.add_argument("--max-reference-test-per-dataset", type=int, default=0)
     parser.add_argument("--reference-fisher-max-total", type=int, default=None)
     parser.add_argument(
         "--reference-datasets",
@@ -570,7 +650,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         max_target_train=args.max_target_train,
         max_candidates=args.max_candidates,
+        max_candidate_validation=args.max_candidate_validation,
+        max_candidate_test=args.max_candidate_test,
         max_reference_per_dataset=args.max_reference_per_dataset,
+        max_reference_validation_per_dataset=args.max_reference_validation_per_dataset,
+        max_reference_test_per_dataset=args.max_reference_test_per_dataset,
         reference_fisher_max_total=args.reference_fisher_max_total,
         reference_datasets=[item.strip() for item in args.reference_datasets.split(",") if item.strip()],
         candidate_source=args.candidate_source,
@@ -596,10 +680,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "counts": counts,
         "schema": {
-            "target_file": "target_all.jsonl",
+            "target_gradient_file": "target_train.jsonl",
+            "target_dev_file": "target_dev.jsonl",
+            "target_test_file": "target_test.jsonl",
             "candidate_pool_file": "candidate_pool.jsonl",
+            "candidate_validation_file": "candidate_validation.jsonl",
+            "candidate_test_file": "candidate_test.jsonl",
             "reference_prompt_file": "reference_prompts.jsonl",
-            "reference_eval_file": "reference_eval/mcq_ood_eval.jsonl",
+            "reference_validation_file": "reference_validation.jsonl",
+            "reference_test_file": "reference_test.jsonl",
+            "reference_eval_dir": "reference_eval/",
+            "reference_ood_eval_file": "reference_eval/mcq_ood_test.jsonl",
             "fisher_reference_excludes": ["ifeval"],
             "supervised_answer_format": "assistant contains only the correct option letter for MCQ tasks",
         },
