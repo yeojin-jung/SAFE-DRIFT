@@ -241,7 +241,7 @@ def relative_output_parts(entry: dict[str, Any]) -> list[str]:
     return name_parts
 
 
-def shared_paths(
+def shared_feature_cache_path(
     command: list[str],
     entry: dict[str, Any],
     *,
@@ -256,9 +256,7 @@ def shared_paths(
     projection_seed = safe_slug(get_value(command, "--selector-projection-seed", "13"))
     shared_tag = f"{method}_{preconditioner}_target{target_seed}_ref{reference_seed}_proj{projection_seed}"
     root = (project_dir / shared_cache_root / Path(*prefix) / shared_tag).resolve()
-    feature_cache = root / "selector_feature_cache"
-    train_cache = (project_dir / shared_cache_root / Path(*prefix) / "train_cache").resolve()
-    return feature_cache, train_cache
+    return root / "selector_feature_cache"
 
 
 def transform_common(
@@ -269,18 +267,17 @@ def transform_common(
     shared_cache_root: Path,
     save_steps: int,
     run_entanglement_analysis: bool,
-) -> tuple[Path, Path]:
-    feature_cache, train_cache = shared_paths(
+) -> Path:
+    feature_cache = shared_feature_cache_path(
         command,
         entry,
         project_dir=project_dir,
         shared_cache_root=shared_cache_root,
     )
     set_flag(command, "--feature-cache-dir", str(feature_cache))
-    set_flag(command, "--train-cache-dir", str(train_cache))
     set_flag(command, "--save-steps", str(save_steps))
     set_bool(command, "--run-entanglement-analysis", run_entanglement_analysis)
-    return feature_cache, train_cache
+    return feature_cache
 
 
 def split_baseline_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -298,6 +295,7 @@ def split_baseline_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
         set_flag(split_command, "--output-dir", str(selector_output_dir))
         set_flag(split_command, "--selection-output-dir", str(selector_output_dir / "subsets"))
         set_flag(split_command, "--training-output-dir", str(selector_output_dir / "training_runs"))
+        set_flag(split_command, "--train-cache-dir", str(selector_output_dir / "train_cache"))
         if index > 0:
             add_bool(split_command, "--skip-base-eval")
         split_entry["name"] = f"{entry['name']}/{safe_slug(selector)}"
@@ -317,7 +315,7 @@ def build_cache_prep_item(
 ) -> dict[str, Any]:
     prep_entry = copy.deepcopy(entry)
     prep_command = list(command)
-    feature_cache, _ = transform_common(
+    feature_cache = transform_common(
         prep_command,
         prep_entry,
         project_dir=project_dir,
