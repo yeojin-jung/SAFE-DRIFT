@@ -17,7 +17,7 @@ prepare:
       - --max-target-train
       - "100"
       - --max-candidates
-      - "0"
+      - "40000"
       - --max-candidate-validation
       - "512"
       - --max-candidate-test
