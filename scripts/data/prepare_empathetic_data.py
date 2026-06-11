@@ -6,8 +6,10 @@ Outputs:
   - target_train.jsonl: target-gradient subset retained for inspection/backward compatibility
   - target_eval.jsonl: held-out ESConv subset retained for inspection/backward compatibility
   - candidate_pool.jsonl: Empathetic Dialogues candidate pool
-  - reference_eval/gsm8k.jsonl: GSM8K reference/evaluation records
-  - reference_prompts.jsonl: same GSM8K records for reference Fisher construction
+  - reference_prompts.jsonl: GSM8K records for reference Fisher construction
+  - reference_validation.jsonl: disjoint GSM8K records for hyperparameter validation
+  - reference_test.jsonl: disjoint GSM8K records for held-out drift evaluation
+  - reference_eval/gsm8k_test.jsonl: same held-out GSM8K test split for OOD evaluation
   - manifest.json
 """
 from __future__ import annotations
@@ -204,6 +206,33 @@ def unique_records(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
+def record_key(record: dict[str, Any]) -> str:
+    return str(record.get("id") or record.get("text_hash") or stable_hash(json.dumps(record, sort_keys=True)))
+
+
+def assert_disjoint_split_sets(named_records: dict[str, Sequence[dict[str, Any]]]) -> dict[str, int]:
+    names = list(named_records)
+    key_sets = {
+        name: {record_key(record) for record in records if record is not None}
+        for name, records in named_records.items()
+    }
+    overlap_counts: dict[str, int] = {}
+    examples: list[str] = []
+    for left_index, left_name in enumerate(names):
+        for right_name in names[left_index + 1 :]:
+            overlap = key_sets[left_name] & key_sets[right_name]
+            check_name = f"{left_name}__{right_name}"
+            overlap_counts[check_name] = len(overlap)
+            if overlap:
+                examples.extend(f"{check_name}:{key}" for key in sorted(overlap)[:5])
+    if examples:
+        raise ValueError(
+            "Prepared data split leakage detected. Overlapping record keys: "
+            + ", ".join(examples[:10])
+        )
+    return overlap_counts
+
+
 def load_hf_dataset(repo: str, *args: Any, split: str, **kwargs: Any):
     kwargs.setdefault("trust_remote_code", True)
     try:
@@ -375,7 +404,7 @@ def format_gsm8k(max_count: int, seed: int) -> list[dict[str, Any]]:
     return records
 
 
-def build_dataset(out_dir: Path, config: BuildConfig) -> dict[str, int]:
+def build_dataset(out_dir: Path, config: BuildConfig) -> tuple[dict[str, int], dict[str, int]]:
     target_records: list[dict[str, Any]] = []
     for split in config.target_splits:
         print(f"[target] formatting ESConv split={split} ...", file=sys.stderr)
@@ -413,6 +442,34 @@ def build_dataset(out_dir: Path, config: BuildConfig) -> dict[str, int]:
         seed=config.seed + stable_int("gsm8k:reference_split"),
     )
 
+    overlap_checks: dict[str, int] = {}
+    overlap_checks.update(
+        assert_disjoint_split_sets(
+            {
+                "target_train": target_train,
+                "target_eval": target_eval,
+            }
+        )
+    )
+    overlap_checks.update(
+        assert_disjoint_split_sets(
+            {
+                "candidate_pool": candidates,
+                "candidate_validation": candidate_validation,
+                "candidate_test": candidate_test,
+            }
+        )
+    )
+    overlap_checks.update(
+        assert_disjoint_split_sets(
+            {
+                "reference_fit_gsm8k": reference_fit,
+                "reference_validation_gsm8k": reference_validation,
+                "reference_test_gsm8k": reference_test,
+            }
+        )
+    )
+
     counts = {
         "target_all": write_jsonl(out_dir / "target_all.jsonl", target_all),
         "target_train": write_jsonl(out_dir / "target_train.jsonl", target_train),
@@ -430,7 +487,7 @@ def build_dataset(out_dir: Path, config: BuildConfig) -> dict[str, int]:
         "reference_validation": write_jsonl(out_dir / "reference_validation.jsonl", reference_validation),
         "reference_test": write_jsonl(out_dir / "reference_test.jsonl", reference_test),
     }
-    return counts
+    return counts, overlap_checks
 
 
 def parse_csv_list(value: str) -> list[str]:
@@ -475,7 +532,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_splits=parse_csv_list(args.target_splits),
         overwrite=bool(args.overwrite),
     )
-    counts = build_dataset(out_dir, config)
+    counts, overlap_checks = build_dataset(out_dir, config)
     manifest = {
         "config": asdict(config),
         "sources": {
@@ -484,6 +541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reference/gsm8k": GSM8K_SOURCE,
         },
         "counts": counts,
+        "split_overlap_checks": overlap_checks,
         "schema": {
             "target_file": "target_all.jsonl",
             "candidate_pool_file": "candidate_pool.jsonl",
@@ -492,8 +550,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reference_prompt_file": "reference_prompts.jsonl",
             "reference_validation_file": "reference_validation.jsonl",
             "reference_test_file": "reference_test.jsonl",
-            "reference_eval_file": "reference_eval/gsm8k.jsonl",
+            "ood_eval_file": "reference_eval/gsm8k_test.jsonl",
+            "reference_eval_file": "reference_eval/gsm8k_test.jsonl",
         },
+        "reference_split_policy": (
+            "GSM8K reference_prompts, reference_validation, and reference_test are sampled "
+            "as disjoint splits. The OOD drift evaluator uses reference_eval/gsm8k_test.jsonl, "
+            "which is the same held-out split as reference_test.jsonl and is not used for "
+            "reference Fisher construction."
+        ),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({"out_dir": str(out_dir), "counts": counts}, indent=2), file=sys.stderr)

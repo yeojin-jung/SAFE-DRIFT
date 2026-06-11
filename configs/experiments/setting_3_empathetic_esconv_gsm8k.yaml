@@ -1,6 +1,6 @@
 experiment:
-  id: setting_3_empathetic_esconv_gsm8k
-  name: "Setting 3: Empathetic Dialogues / ESConv / GSM8K"
+  id: setting_3_empathetic_candidates_esconv_target_gsm8k_reference
+  name: "Setting 3: Empathetic candidates / ESConv target / GSM8K reference"
 
 repeat_seeds: [42]
 
@@ -9,7 +9,7 @@ prepare:
       - python
       - scripts/data/prepare_empathetic_data.py
       - --out
-      - data/setting_3_empathetic/prepared_{repeat_tag}
+      - data/setting_3_empathetic_esconv_gsm8k/prepared_{repeat_tag}
       - --seed
       - "{repeat_seed}"
       - --target-splits
@@ -33,14 +33,14 @@ prepare:
       - --overwrite
 
 data:
-  candidate_file: data/setting_3_empathetic/prepared_{repeat_tag}/candidate_pool.jsonl
-  candidate_validation_file: data/setting_3_empathetic/prepared_{repeat_tag}/candidate_validation.jsonl
-  candidate_test_file: data/setting_3_empathetic/prepared_{repeat_tag}/candidate_test.jsonl
-  target_file: data/setting_3_empathetic/prepared_{repeat_tag}/target_all.jsonl
-  ood_eval_file: data/setting_3_empathetic/prepared_{repeat_tag}/reference_eval/gsm8k_test.jsonl
-  reference_file: data/setting_3_empathetic/prepared_{repeat_tag}/reference_prompts.jsonl
-  reference_validation_file: data/setting_3_empathetic/prepared_{repeat_tag}/reference_validation.jsonl
-  reference_test_file: data/setting_3_empathetic/prepared_{repeat_tag}/reference_test.jsonl
+  candidate_file: data/setting_3_empathetic_esconv_gsm8k/prepared_{repeat_tag}/candidate_pool.jsonl
+  candidate_validation_file: data/setting_3_empathetic_esconv_gsm8k/prepared_{repeat_tag}/candidate_validation.jsonl
+  candidate_test_file: data/setting_3_empathetic_esconv_gsm8k/prepared_{repeat_tag}/candidate_test.jsonl
+  target_file: data/setting_3_empathetic_esconv_gsm8k/prepared_{repeat_tag}/target_all.jsonl
+  ood_eval_file: data/setting_3_empathetic_esconv_gsm8k/prepared_{repeat_tag}/reference_eval/gsm8k_test.jsonl
+  reference_file: data/setting_3_empathetic_esconv_gsm8k/prepared_{repeat_tag}/reference_prompts.jsonl
+  reference_validation_file: data/setting_3_empathetic_esconv_gsm8k/prepared_{repeat_tag}/reference_validation.jsonl
+  reference_test_file: data/setting_3_empathetic_esconv_gsm8k/prepared_{repeat_tag}/reference_test.jsonl
 
 model_variants:
   - name: olmo7b_instruct_gradient_equals_ft
@@ -147,11 +147,11 @@ training:
 
 evaluation:
   evaluator: esconv
-  ood_evaluator: none
+  ood_evaluator: gsm8k
   reference_evaluator: gsm8k
   compute_entanglement_metrics: true
   entanglement_target_sample_size: 128
   entanglement_selected_csv_max_rows: 5000
-  benchmark_evals: ["gsm8k"]
+  benchmark_evals: []
   benchmark_max_examples: 128
   eval_max_examples: 128
