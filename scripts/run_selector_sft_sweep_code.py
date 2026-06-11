@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fcntl
 import gc
 import hashlib
 import json
 import math
+import os
 import random
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -502,6 +505,31 @@ def selector_preconditioner_cache_path(args: argparse.Namespace, warmup_steps: i
     return Path(args.feature_cache_dir) / "preconditioners" / f"{'_'.join(parts)}.pt"
 
 
+@contextmanager
+def exclusive_cache_lock(path: Path):
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def torch_save_atomic(payload: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
 def projected_dtype_from_name(dtype_name: str) -> torch.dtype:
     mapping = {
         "float16": torch.float16,
@@ -539,51 +567,52 @@ def build_selector_preconditioner(
     warmup_steps = resolved_adam_warmup_steps(args, candidates)
     cache_path = selector_preconditioner_cache_path(args, warmup_steps)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    if cache_path.exists() and not args.overwrite_selection_cache:
-        payload = torch.load(cache_path, map_location="cpu")
-        preconditioner = payload["preconditioner"].cpu()
-        metadata = payload.get("metadata", {})
-        return preconditioner, {
-            **metadata,
-            "selector_preconditioner": "adam",
-            "preconditioner_cache_hit": True,
-            "preconditioner_cache_path": str(cache_path),
-            "preconditioner_wallclock_seconds": 0.0,
-            "adam_warmup_steps_resolved": warmup_steps,
-        }
+    with exclusive_cache_lock(cache_path):
+        if cache_path.exists() and not args.overwrite_selection_cache:
+            payload = torch.load(cache_path, map_location="cpu")
+            preconditioner = payload["preconditioner"].cpu()
+            metadata = payload.get("metadata", {})
+            return preconditioner, {
+                **metadata,
+                "selector_preconditioner": "adam",
+                "preconditioner_cache_hit": True,
+                "preconditioner_cache_path": str(cache_path),
+                "preconditioner_wallclock_seconds": 0.0,
+                "adam_warmup_steps_resolved": warmup_steps,
+            }
 
-    start = time.perf_counter()
-    v_bar = estimate_adam_second_moment(
-        model=model,
-        tokenizer=tokenizer,
-        warmup_data=warmup_data,
-        beta2=args.adam_beta2,
-        n_steps=warmup_steps,
-        device=device,
-        max_seq_len=args.max_seq_len,
-        use_lora=True,
-    )
-    preconditioner = build_adam_preconditioner(v_bar, eps=args.adam_eps, eta=1.0).cpu()
-    elapsed = time.perf_counter() - start
-    metadata = {
-        "selector_preconditioner": "adam",
-        "preconditioner_cache_hit": False,
-        "preconditioner_cache_path": str(cache_path),
-        "preconditioner_wallclock_seconds": elapsed,
-        "adam_warmup_steps_resolved": warmup_steps,
-        "adam_warmup_pool_size": len(warmup_data),
-        "adam_beta2": args.adam_beta2,
-        "adam_eps": args.adam_eps,
-        "adam_warmup_steps": args.adam_warmup_steps,
-    }
-    torch.save(
-        {
-            "preconditioner": preconditioner.cpu(),
-            "v_bar": v_bar.cpu(),
-            "metadata": metadata,
-        },
-        cache_path,
-    )
+        start = time.perf_counter()
+        v_bar = estimate_adam_second_moment(
+            model=model,
+            tokenizer=tokenizer,
+            warmup_data=warmup_data,
+            beta2=args.adam_beta2,
+            n_steps=warmup_steps,
+            device=device,
+            max_seq_len=args.max_seq_len,
+            use_lora=True,
+        )
+        preconditioner = build_adam_preconditioner(v_bar, eps=args.adam_eps, eta=1.0).cpu()
+        elapsed = time.perf_counter() - start
+        metadata = {
+            "selector_preconditioner": "adam",
+            "preconditioner_cache_hit": False,
+            "preconditioner_cache_path": str(cache_path),
+            "preconditioner_wallclock_seconds": elapsed,
+            "adam_warmup_steps_resolved": warmup_steps,
+            "adam_warmup_pool_size": len(warmup_data),
+            "adam_beta2": args.adam_beta2,
+            "adam_eps": args.adam_eps,
+            "adam_warmup_steps": args.adam_warmup_steps,
+        }
+        torch_save_atomic(
+            {
+                "preconditioner": preconditioner.cpu(),
+                "v_bar": v_bar.cpu(),
+                "metadata": metadata,
+            },
+            cache_path,
+        )
     return preconditioner, metadata
 
 
@@ -601,7 +630,8 @@ def maybe_load_projected_preconditioner(info: dict[str, Any]) -> torch.Tensor | 
     path = Path(path_raw)
     if not path.exists():
         return None
-    payload = torch.load(path, map_location="cpu")
+    with exclusive_cache_lock(path):
+        payload = torch.load(path, map_location="cpu")
     key = projected_preconditioner_cache_key(info)
     projected_dict = payload.get("projected_preconditioners")
     if isinstance(projected_dict, dict) and key is not None:
@@ -652,32 +682,33 @@ def save_projected_preconditioner(
     else:
         raise ValueError(f"Unsupported selector_feature_method: {selector_feature_method}")
 
-    payload = torch.load(path, map_location="cpu") if path.exists() else {"metadata": dict(preconditioner_info)}
-    metadata = payload.get("metadata", {})
-    key = selector_feature_cache_path.stem
-    projected_metadata = payload.get("projected_preconditioner_metadata")
-    if not isinstance(projected_metadata, dict):
-        projected_metadata = {}
-    projected_store = payload.get("projected_preconditioners")
-    if not isinstance(projected_store, dict):
-        projected_store = {}
-    metadata.update(
-        {
-            **preconditioner_info,
+    with exclusive_cache_lock(path):
+        payload = torch.load(path, map_location="cpu") if path.exists() else {"metadata": dict(preconditioner_info)}
+        metadata = payload.get("metadata", {})
+        key = selector_feature_cache_path.stem
+        projected_metadata = payload.get("projected_preconditioner_metadata")
+        if not isinstance(projected_metadata, dict):
+            projected_metadata = {}
+        projected_store = payload.get("projected_preconditioners")
+        if not isinstance(projected_store, dict):
+            projected_store = {}
+        metadata.update(
+            {
+                **preconditioner_info,
+            }
+        )
+        payload["metadata"] = metadata
+        projected_store[key] = projected.cpu()
+        payload["projected_preconditioners"] = projected_store
+        projected_metadata[key] = {
+            "selector_feature_method": selector_feature_method,
+            "selector_feature_cache_path": str(selector_feature_cache_path),
+            "projected_preconditioner_shape": tuple(projected.shape),
+            "projected_preconditioner_basis": projected_basis,
         }
-    )
-    payload["metadata"] = metadata
-    projected_store[key] = projected.cpu()
-    payload["projected_preconditioners"] = projected_store
-    projected_metadata[key] = {
-        "selector_feature_method": selector_feature_method,
-        "selector_feature_cache_path": str(selector_feature_cache_path),
-        "projected_preconditioner_shape": tuple(projected.shape),
-        "projected_preconditioner_basis": projected_basis,
-    }
-    payload["projected_preconditioner_metadata"] = projected_metadata
-    payload["projected_preconditioner"] = projected.cpu()
-    torch.save(payload, path)
+        payload["projected_preconditioner_metadata"] = projected_metadata
+        payload["projected_preconditioner"] = projected.cpu()
+        torch_save_atomic(payload, path)
     return projected.cpu()
 
 
