@@ -1,6 +1,6 @@
 experiment:
-  id: setting_2_medqa_medmcqa_truthfulqa_bbq_ifeval
-  name: "Setting 2: MedQA / MedMCQA / TruthfulQA+BBQ+IFEval"
+  id: setting_2_medqa_medmcqa_truthfulqa_bbq
+  name: "Setting 2: MedQA / MedMCQA / TruthfulQA+BBQ"
 
 repeat_seeds: [42]
 
@@ -27,7 +27,7 @@ prepare:
       - --max-reference-test-per-dataset
       - "128"
       - --reference-datasets
-      - ifeval,truthfulqa,bbq
+      - truthfulqa,bbq
       - --overwrite
 
 data:
@@ -37,7 +37,7 @@ data:
   target_file: data/setting_2_medical/prepared_{repeat_tag}/target_train.jsonl
   validation_file: data/setting_2_medical/prepared_{repeat_tag}/target_dev.jsonl
   eval_file: data/setting_2_medical/prepared_{repeat_tag}/target_test.jsonl
-  ood_eval_file: data/setting_2_medical/prepared_{repeat_tag}/reference_eval/mcq_ood_test.jsonl
+  ood_eval_file: data/setting_2_medical/prepared_{repeat_tag}/reference_test.jsonl
   reference_file: data/setting_2_medical/prepared_{repeat_tag}/reference_prompts.jsonl
   reference_validation_file: data/setting_2_medical/prepared_{repeat_tag}/reference_validation.jsonl
   reference_test_file: data/setting_2_medical/prepared_{repeat_tag}/reference_test.jsonl
@@ -159,9 +159,9 @@ training:
 
 evaluation:
   evaluator: medqa
-  ood_evaluator: medqa
+  ood_evaluator: medical_reference
   reference_evaluator: loss
-  generation_max_new_tokens: 32
+  generation_max_new_tokens: 64
   compute_entanglement_metrics: true
   entanglement_target_sample_size: 128
   entanglement_selected_csv_max_rows: 5000

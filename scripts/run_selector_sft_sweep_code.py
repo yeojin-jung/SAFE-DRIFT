@@ -35,7 +35,7 @@ from baseline_selectors.dsir import select_dsir
 from baseline_selectors.less_selector import select_less
 from baseline_selectors.prismatic_selector import select_prismatic
 from baseline_selectors.random_selector import select_random
-from evaluation import humaneval as humaneval_evaluator
+from evaluation import get_evaluator, humaneval as humaneval_evaluator
 from evaluation.bias_disentangle import evaluate_base_model as evaluate_base_bias_metrics
 from evaluation.entanglement_analysis import (
     analyze_entanglement,
@@ -1989,14 +1989,31 @@ def evaluate_base_model_once(
 ) -> dict[str, Any] | None:
     base_eval_path = output_dir / "base_model_eval.json"
     base_eval_output_dir = output_dir / "base_model_eval"
-    shared_base_eval_path = Path(args.feature_cache_dir).resolve().parent / "base_model_eval.json"
-    shared_base_eval_output_dir = Path(args.feature_cache_dir).resolve().parent / "base_model_eval"
+    ood_evaluator = args.ood_evaluator or args.evaluator
+    ood_eval_cache_tag = "ood_none"
+    if args.ood_eval_file and ood_evaluator not in {"none", "bias_disentangle"}:
+        ood_eval_cache_tag = f"ood_{safe_slug(ood_evaluator)}_{file_fingerprint(args.ood_eval_file)}"
+    bias_eval_cache_tag = "bias_none"
+    if bias_eval_data_path is not None:
+        bias_eval_cache_tag = f"bias_{file_fingerprint(bias_eval_data_path)}"
+    shared_cache_stem = "_".join(
+        [
+            "base_model_eval",
+            safe_slug(args.model_name),
+            safe_slug(args.train_torch_dtype),
+            ood_eval_cache_tag,
+            bias_eval_cache_tag,
+        ]
+    )
+    shared_base_eval_path = Path(args.feature_cache_dir).resolve().parent / f"{shared_cache_stem}.json"
+    shared_base_eval_output_dir = Path(args.feature_cache_dir).resolve().parent / shared_cache_stem
     if args.dry_run:
         payload = {
             "output_file": str(base_eval_path.resolve()),
             "shared_output_file": str(shared_base_eval_path.resolve()),
             "output_dir": str(base_eval_output_dir.resolve()),
             "ood_eval_file": None if args.ood_eval_file is None else str(Path(args.ood_eval_file).resolve()),
+            "ood_evaluator": ood_evaluator,
             "bias_eval_data_path": None if bias_eval_data_path is None else str(Path(bias_eval_data_path).resolve()),
             "eval_max_examples": args.eval_max_examples,
             "bias_eval_max_examples": args.bias_eval_max_examples,
@@ -2005,8 +2022,12 @@ def evaluate_base_model_once(
         write_json(payload, base_eval_path)
         return payload
 
-    humaneval_records = load_records(args.ood_eval_file) if args.ood_eval_file else []
-    if not humaneval_records and bias_eval_data_path is None:
+    ood_records = (
+        load_records(args.ood_eval_file)
+        if args.ood_eval_file and ood_evaluator not in {"none", "bias_disentangle"}
+        else []
+    )
+    if not ood_records and bias_eval_data_path is None:
         return None
     if shared_base_eval_path.exists():
         payload = json.loads(shared_base_eval_path.read_text(encoding="utf-8"))
@@ -2018,6 +2039,7 @@ def evaluate_base_model_once(
     payload: dict[str, Any] = {
         "model_name": args.model_name,
         "ood_eval_file": None if args.ood_eval_file is None else str(Path(args.ood_eval_file).resolve()),
+        "ood_evaluator": ood_evaluator,
         "bias_eval_data_path": None if bias_eval_data_path is None else str(Path(bias_eval_data_path).resolve()),
         "eval_max_examples": args.eval_max_examples,
         "bias_eval_max_examples": args.bias_eval_max_examples,
@@ -2025,7 +2047,7 @@ def evaluate_base_model_once(
 
     model = None
     tokenizer = None
-    if humaneval_records:
+    if ood_records:
         base_eval_args = argparse.Namespace(
             model_name_or_path=args.model_name,
             use_slow_tokenizer=False,
@@ -2037,20 +2059,32 @@ def evaluate_base_model_once(
         device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
         model.to(device)
         model.eval()
-        humaneval_metrics = humaneval_evaluator.evaluate_records(
-            model=model,
-            tokenizer=tokenizer,
-            records=humaneval_records,
-            device=device,
-            max_examples=args.eval_max_examples,
-            max_new_tokens=args.generation_max_new_tokens,
-            add_bos_token=args.add_bos_token,
-            num_samples=args.humaneval_num_samples,
-            pass_at_ks=tuple(args.humaneval_pass_at_ks),
-            temperature=args.humaneval_temperature,
-            top_p=args.humaneval_top_p,
-        )
-        payload.update({f"base_ood_{key}": value for key, value in humaneval_metrics.items()})
+        if ood_evaluator == "humaneval":
+            ood_metrics = humaneval_evaluator.evaluate_records(
+                model=model,
+                tokenizer=tokenizer,
+                records=ood_records,
+                device=device,
+                max_examples=args.eval_max_examples,
+                max_new_tokens=args.generation_max_new_tokens,
+                add_bos_token=args.add_bos_token,
+                num_samples=args.humaneval_num_samples,
+                pass_at_ks=tuple(args.humaneval_pass_at_ks),
+                temperature=args.humaneval_temperature,
+                top_p=args.humaneval_top_p,
+            )
+        else:
+            evaluator = get_evaluator(ood_evaluator)
+            ood_metrics = evaluator(
+                model=model,
+                tokenizer=tokenizer,
+                records=ood_records,
+                device=device,
+                max_examples=args.eval_max_examples,
+                max_new_tokens=args.generation_max_new_tokens,
+                add_bos_token=args.add_bos_token,
+            )
+        payload.update({f"base_ood_{key}": value for key, value in ood_metrics.items()})
 
     if model is not None:
         del model

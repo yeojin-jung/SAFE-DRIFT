@@ -1026,17 +1026,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--evaluator",
         default="none",
-        choices=["none", "medqa", "mmlu", "gsm8k", "esconv", "humaneval", "ifeval", "bias_disentangle"],
+        choices=[
+            "none",
+            "medqa",
+            "mmlu",
+            "gsm8k",
+            "esconv",
+            "humaneval",
+            "ifeval",
+            "medical_reference",
+            "bias_disentangle",
+        ],
     )
     parser.add_argument(
         "--ood-evaluator",
         default=None,
-        choices=["none", "medqa", "mmlu", "gsm8k", "esconv", "humaneval", "ifeval", "bias_disentangle"],
+        choices=[
+            "none",
+            "medqa",
+            "mmlu",
+            "gsm8k",
+            "esconv",
+            "humaneval",
+            "ifeval",
+            "medical_reference",
+            "bias_disentangle",
+        ],
     )
     parser.add_argument(
         "--reference-evaluator",
         default="none",
-        choices=["none", "loss", "medqa", "mmlu", "gsm8k", "esconv", "humaneval", "ifeval", "bias_disentangle"],
+        choices=[
+            "none",
+            "loss",
+            "medqa",
+            "mmlu",
+            "gsm8k",
+            "esconv",
+            "humaneval",
+            "ifeval",
+            "medical_reference",
+            "bias_disentangle",
+        ],
     )
     parser.add_argument("--eval-max-examples", type=int, default=None)
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
