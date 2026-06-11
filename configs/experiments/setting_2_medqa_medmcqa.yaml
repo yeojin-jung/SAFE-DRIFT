@@ -1,6 +1,6 @@
 experiment:
-  id: setting_2_medqa_medmcqa_truthfulqa_bbq
-  name: "Setting 2: MedQA / MedMCQA / TruthfulQA+BBQ"
+  id: setting_2_medqa_target_medmcqa_candidates_truthfulqa_bbq_eval
+  name: "Setting 2: MedQA target / MedMCQA candidates / TruthfulQA+BBQ eval"
 
 repeat_seeds: [42]
 
@@ -9,13 +9,13 @@ prepare:
       - python
       - scripts/data/prepare_medical_data.py
       - --out
-      - data/setting_2_medical/prepared_{repeat_tag}
+      - data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}
       - --seed
       - "{repeat_seed}"
       - --max-target-train
       - "256"
       - --max-candidates
-      - "2000"
+      - "10000"
       - --max-candidate-validation
       - "256"
       - --max-candidate-test
@@ -26,21 +26,23 @@ prepare:
       - "128"
       - --max-reference-test-per-dataset
       - "128"
+      - --candidate-source
+      - medmcqa
       - --reference-datasets
       - truthfulqa,bbq
       - --overwrite
 
 data:
-  candidate_file: data/setting_2_medical/prepared_{repeat_tag}/candidate_pool.jsonl
-  candidate_validation_file: data/setting_2_medical/prepared_{repeat_tag}/candidate_validation.jsonl
-  candidate_test_file: data/setting_2_medical/prepared_{repeat_tag}/candidate_test.jsonl
-  target_file: data/setting_2_medical/prepared_{repeat_tag}/target_train.jsonl
-  validation_file: data/setting_2_medical/prepared_{repeat_tag}/target_dev.jsonl
-  eval_file: data/setting_2_medical/prepared_{repeat_tag}/target_test.jsonl
-  ood_eval_file: data/setting_2_medical/prepared_{repeat_tag}/reference_test.jsonl
-  reference_file: data/setting_2_medical/prepared_{repeat_tag}/reference_prompts.jsonl
-  reference_validation_file: data/setting_2_medical/prepared_{repeat_tag}/reference_validation.jsonl
-  reference_test_file: data/setting_2_medical/prepared_{repeat_tag}/reference_test.jsonl
+  candidate_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/candidate_pool.jsonl
+  candidate_validation_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/candidate_validation.jsonl
+  candidate_test_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/candidate_test.jsonl
+  target_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/target_train.jsonl
+  validation_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/target_dev.jsonl
+  eval_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/target_test.jsonl
+  ood_eval_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_test.jsonl
+  reference_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_prompts.jsonl
+  reference_validation_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_validation.jsonl
+  reference_test_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_test.jsonl
 
 model_variants:
   - name: olmo7b_instruct_gradient_equals_ft
@@ -61,7 +63,7 @@ model_variants:
     enabled: false
 
 baseline_selectors: ["random", "dsir", "less", "prismatic"]
-subset_percentages: [25.6]
+subset_percentages: [5.12]
 
 splits:
   target: [1.0, 0.0, 0.0]
