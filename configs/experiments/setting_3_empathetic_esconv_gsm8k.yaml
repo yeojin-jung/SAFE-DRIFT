@@ -76,7 +76,7 @@ selection:
   reference_fisher_max_examples: 128
   validation_gradient_max_examples: 128
   low_rank_target_max_examples: 100
-  low_rank_candidate_max_examples: 512
+  low_rank_candidate_max_examples: 256
   low_rank_candidate_projection_chunk_rows: 128
   safe_geometry: reference
   safe_solver: greedy_marginal

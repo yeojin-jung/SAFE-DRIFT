@@ -827,7 +827,7 @@ def compute_low_rank_selector_features(
         reference_cap=args.reference_fisher_max_examples,
         target_cap=args.low_rank_target_max_examples,
         candidate_cap=args.low_rank_candidate_max_examples,
-        projection_chunk_rows=0,
+        projection_chunk_rows=args.low_rank_candidate_projection_chunk_rows,
     )
 
     start = time.perf_counter()
@@ -859,6 +859,7 @@ def compute_low_rank_selector_features(
         include_full_gradients=False,
         include_basis=False,
         save_target_features=bool(getattr(args, "save_all_target_features", False)),
+        candidate_projection_chunk_rows=int(args.low_rank_candidate_projection_chunk_rows),
     )
     candidate_features = safe_inputs.candidate_features.cpu()
     target_feature = safe_inputs.target_feature.cpu()
