@@ -360,7 +360,19 @@ def get_dtype(dtype_name: str) -> torch.dtype:
     return mapping[lowered]
 
 
+def configure_attention_backend() -> str | None:
+    disable_cudnn_sdp = os.environ.get("SAFEDRIFT_DISABLE_CUDNN_SDP", "1").strip().lower()
+    if disable_cudnn_sdp not in {"0", "false", "no"} and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        torch.backends.cuda.enable_cudnn_sdp(False)
+
+    implementation = os.environ.get("SAFEDRIFT_ATTENTION_IMPLEMENTATION", "eager").strip()
+    if implementation.lower() in {"", "auto", "default", "none"}:
+        return None
+    return implementation
+
+
 def build_base_model_and_tokenizer(args: argparse.Namespace):
+    attn_implementation = configure_attention_backend()
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
         use_fast=not args.use_slow_tokenizer,
@@ -369,12 +381,14 @@ def build_base_model_and_tokenizer(args: argparse.Namespace):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=get_dtype(args.torch_dtype),
-        trust_remote_code=args.trust_remote_code,
-        low_cpu_mem_usage=args.low_cpu_mem_usage,
-    )
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": get_dtype(args.torch_dtype),
+        "trust_remote_code": args.trust_remote_code,
+        "low_cpu_mem_usage": args.low_cpu_mem_usage,
+    }
+    if attn_implementation is not None:
+        model_kwargs["attn_implementation"] = attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
     required_vocab_size = max(tokenizer.get_vocab().values()) + 1
     if model.get_input_embeddings().weight.shape[0] < required_vocab_size:
         model.resize_token_embeddings(required_vocab_size)

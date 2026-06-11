@@ -250,11 +250,10 @@ def shared_feature_cache_path(
 ) -> tuple[Path, Path]:
     prefix = relative_output_parts(entry)
     method = safe_slug(get_value(command, "--selector-feature-method", "low_rank"))
-    preconditioner = safe_slug(get_value(command, "--selector-preconditioner", "adam"))
     target_seed = safe_slug(get_value(command, "--target-split-seed", "42"))
     reference_seed = safe_slug(get_value(command, "--reference-split-seed", "42"))
     projection_seed = safe_slug(get_value(command, "--selector-projection-seed", "13"))
-    shared_tag = f"{method}_{preconditioner}_target{target_seed}_ref{reference_seed}_proj{projection_seed}"
+    shared_tag = f"{method}_target{target_seed}_ref{reference_seed}_proj{projection_seed}"
     root = (project_dir / shared_cache_root / Path(*prefix) / shared_tag).resolve()
     return root / "selector_feature_cache"
 
@@ -353,6 +352,7 @@ def is_same_cache_prep(left: dict[str, Any], right: dict[str, Any]) -> bool:
         "--safe-learning-rate",
         "--save-steps",
         "--selectors",
+        "--selector-preconditioner",
     }
     for key in set(left_map) | set(right_map):
         if key in ignored:

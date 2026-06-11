@@ -142,7 +142,13 @@ def split_lookup(
 
 
 def prepare_candidate_pools(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Split candidate data so Adam preconditioner estimation cannot leak into selection/SFT."""
+    """Prepare candidate data and optional Adam warmup examples.
+
+    The selector candidate pool is intentionally stable across Adam/SGD and
+    SAFE hyperparameters so all variants can reuse the same cached gradient
+    features. Adam still estimates its preconditioner on a deterministic
+    warmup subset, but that subset no longer changes the selection pool.
+    """
     split_info: dict[str, Any] = {
         "preconditioner_data_disjoint": False,
         "preconditioner_candidate_count": 0,
@@ -156,7 +162,7 @@ def prepare_candidate_pools(args: argparse.Namespace, candidates: list[dict[str,
         return candidates, candidates, split_info
 
     if len(candidates) < 2:
-        raise ValueError("Need at least 2 candidates to hold out disjoint Adam preconditioner data.")
+        raise ValueError("Need at least 2 candidates to sample Adam preconditioner warmup data.")
 
     holdout_size = max(1, math.ceil(len(candidates) * float(args.adam_warmup_steps)))
     holdout_size = min(holdout_size, len(candidates) - 1)
@@ -164,11 +170,11 @@ def prepare_candidate_pools(args: argparse.Namespace, candidates: list[dict[str,
     random.Random(int(args.preconditioner_split_seed)).shuffle(indices)
     preconditioner_ids = set(indices[:holdout_size])
     preconditioner_candidates = [record for idx, record in enumerate(candidates) if idx in preconditioner_ids]
-    selection_candidates = [record for idx, record in enumerate(candidates) if idx not in preconditioner_ids]
+    selection_candidates = list(candidates)
 
     pool_dir = Path(args.feature_cache_dir).resolve().parent / "candidate_pools"
     preconditioner_file = pool_dir / "preconditioner_warmup_candidates.jsonl"
-    selection_file = pool_dir / "selection_candidates_after_preconditioner_holdout.jsonl"
+    selection_file = pool_dir / "selection_candidates_full_pool.jsonl"
     if args.overwrite_selection_cache or not preconditioner_file.exists():
         write_jsonl(preconditioner_candidates, preconditioner_file)
     if args.overwrite_selection_cache or not selection_file.exists():
@@ -176,16 +182,18 @@ def prepare_candidate_pools(args: argparse.Namespace, candidates: list[dict[str,
 
     setattr(args, "_preconditioner_candidates", preconditioner_candidates)
     setattr(args, "_preconditioner_candidate_file", str(preconditioner_file))
-    setattr(args, "_selection_candidate_file", str(selection_file))
+    setattr(args, "_selection_candidate_file", str(Path(args.candidate_file).resolve()))
+    setattr(args, "_selection_candidate_inspection_file", str(selection_file))
 
     split_info.update(
         {
-            "preconditioner_data_disjoint": True,
+            "preconditioner_data_disjoint": False,
             "preconditioner_candidate_count": len(preconditioner_candidates),
             "selection_candidate_count": len(selection_candidates),
             "preconditioner_candidate_file": str(preconditioner_file.resolve()),
             "selection_candidate_file": str(selection_file.resolve()),
             "preconditioner_split_seed": int(args.preconditioner_split_seed),
+            "preconditioner_warmup_excluded_from_selection": False,
         }
     )
     return preconditioner_candidates, selection_candidates, split_info
@@ -193,6 +201,17 @@ def prepare_candidate_pools(args: argparse.Namespace, candidates: list[dict[str,
 
 def print_preconditioner_split_summary(split_info: dict[str, Any]) -> None:
     if not split_info.get("preconditioner_data_disjoint", False):
+        if split_info.get("preconditioner_candidate_file"):
+            print(
+                "[candidate split] Adam warmup uses a deterministic candidate subset; "
+                "selection keeps the full candidate pool "
+                f"(warmup={split_info.get('preconditioner_candidate_count')}, "
+                f"selection={split_info.get('selection_candidate_count')}, "
+                f"seed={split_info.get('preconditioner_split_seed')})."
+            )
+            print(f"[candidate split] preconditioner file: {split_info.get('preconditioner_candidate_file')}")
+            print(f"[candidate split] selection file:     {split_info.get('selection_candidate_file')}")
+            return
         print(
             "[candidate split] preconditioner and selection share the same candidate pool "
             f"(selection={split_info.get('selection_candidate_count')})."
@@ -354,7 +373,6 @@ def selector_feature_descriptor(args: argparse.Namespace) -> dict[str, Any]:
         "target": target_cache_tag(args),
         "reference": reference_tag,
         "selector_feature_method": args.selector_feature_method,
-        "selector_preconditioner": args.selector_preconditioner,
         "reference_max_examples": int(args.reference_fisher_max_examples),
         "K_R": args.low_rank_reference_rank,
         "delta": float(args.low_rank_delta),
@@ -370,11 +388,6 @@ def selector_feature_descriptor(args: argparse.Namespace) -> dict[str, Any]:
         "target_max_examples": args.low_rank_target_max_examples,
         "candidate_max_examples": args.low_rank_candidate_max_examples,
         "candidate_subset_seed": args.seed,
-        "adam_beta2": args.adam_beta2,
-        "adam_eps": args.adam_eps,
-        "adam_warmup_steps": args.adam_warmup_steps,
-        "preconditioner_split_seed": args.preconditioner_split_seed,
-        "preconditioner_data": preconditioner_data_cache_tag(args),
     }
     if args.selector_feature_method == "random_sketch":
         descriptor.update(
@@ -394,7 +407,6 @@ def selector_feature_cache_path(args: argparse.Namespace) -> Path:
     parts = [
         file_fingerprint(getattr(args, "_selection_candidate_file", args.candidate_file)),
         safe_slug(args.selector_feature_method),
-        safe_slug(args.selector_preconditioner),
     ]
     if args.selector_feature_method == "random_sketch":
         parts.extend(
@@ -461,6 +473,13 @@ def write_shared_feature_artifacts(
     )
 
 
+def resolved_adam_warmup_steps(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> int:
+    warmup_data = getattr(args, "_preconditioner_candidates", candidates)
+    if getattr(args, "separate_preconditioner_data", True):
+        return len(warmup_data)
+    return max(1, math.ceil(len(candidates) * float(args.adam_warmup_steps)))
+
+
 def selector_preconditioner_cache_path(args: argparse.Namespace, warmup_steps: int) -> Path:
     descriptor = {
         "candidate": preconditioner_data_cache_tag(args),
@@ -517,10 +536,7 @@ def build_selector_preconditioner(
     warmup_data = getattr(args, "_preconditioner_candidates", candidates)
     if not warmup_data:
         raise ValueError("Adam preconditioner warmup data is empty.")
-    if getattr(args, "separate_preconditioner_data", True):
-        warmup_steps = len(warmup_data)
-    else:
-        warmup_steps = max(1, math.ceil(len(candidates) * float(args.adam_warmup_steps)))
+    warmup_steps = resolved_adam_warmup_steps(args, candidates)
     cache_path = selector_preconditioner_cache_path(args, warmup_steps)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     if cache_path.exists() and not args.overwrite_selection_cache:
@@ -880,16 +896,49 @@ def compute_or_load_shared_selector_features(
         metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
         info = {
             **metadata,
+            "selector_preconditioner": args.selector_preconditioner,
             "selector_feature_cache_hit": True,
             "selector_feature_cache_path": str(cache_path),
             "selector_feature_wallclock_seconds": 0.0,
         }
+        selector_preconditioner = None
+        if args.selector_preconditioner == "adam":
+            basis = payload.get("basis")
+            warmup_steps = resolved_adam_warmup_steps(args, candidates)
+            preconditioner_cache = selector_preconditioner_cache_path(args, warmup_steps)
+            device = torch.device("cpu")
+            model = tokenizer = None
+            if args.overwrite_selection_cache or not preconditioner_cache.exists():
+                device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+                model, tokenizer = load_model_for_selection(args, device=device)
+            preconditioner, preconditioner_info = build_selector_preconditioner(
+                args,
+                candidates,
+                model,
+                tokenizer,
+                device,
+            )
+            selector_preconditioner = save_projected_preconditioner(
+                selector_feature_method=args.selector_feature_method,
+                selector_feature_cache_path=cache_path,
+                preconditioner_info=preconditioner_info,
+                full_preconditioner=preconditioner,
+                basis=basis,
+                projection_dim=args.selector_projection_dim if args.selector_feature_method == "random_sketch" else None,
+                projection_seed=args.selector_projection_seed if args.selector_feature_method == "random_sketch" else None,
+            )
+            info.update(preconditioner_info)
+            if model is not None:
+                del model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         return SharedSelectorFeatures(
             candidate_features=payload["candidate_features"],
             target_feature=payload["target_feature"],
             target_features=payload.get("target_features"),
             reference_fisher=payload.get("reference_fisher"),
-            selector_preconditioner=maybe_load_projected_preconditioner(info),
+            selector_preconditioner=selector_preconditioner,
             info=info,
         )
 
@@ -932,17 +981,21 @@ def compute_or_load_shared_selector_features(
         projection_seed=args.selector_projection_seed if args.selector_feature_method == "random_sketch" else None,
     )
 
-    metadata = {
+    feature_metadata = {
         **selector_feature_descriptor(args),
-        **preconditioner_info,
         **feature_info,
-        "selector_feature_cache_hit": False,
         "selector_feature_cache_path": str(cache_path),
-        "selector_feature_wallclock_seconds": time.perf_counter() - start,
         "candidate_features_shape": tuple(candidate_features.shape),
         "target_feature_shape": tuple(target_feature.shape),
         "target_features_shape": None if target_features is None else tuple(target_features.shape),
         "reference_fisher_shape": None if reference_fisher is None else tuple(reference_fisher.shape),
+    }
+    metadata = {
+        **feature_metadata,
+        **preconditioner_info,
+        "selector_preconditioner": args.selector_preconditioner,
+        "selector_feature_cache_hit": False,
+        "selector_feature_wallclock_seconds": time.perf_counter() - start,
     }
     print(
         "[selector features] saving cache with "
@@ -956,7 +1009,8 @@ def compute_or_load_shared_selector_features(
             "target_feature": target_feature.cpu(),
             "target_features": None if target_features is None else target_features.cpu(),
             "reference_fisher": None if reference_fisher is None else reference_fisher.cpu(),
-            "metadata": metadata,
+            "basis": None if basis is None else basis.cpu(),
+            "metadata": feature_metadata,
         },
         cache_path,
     )
@@ -2608,6 +2662,11 @@ def main() -> None:
     manifest["entanglement_analysis"]["results"] = collect_entanglement_analysis_results(args)
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, ensure_ascii=False)
+    failed_runs = [run for run in manifest.get("runs", []) if int(run.get("train_return_code", 0)) != 0]
+    if failed_runs:
+        failed_tags = ", ".join(str(run.get("method_tag", "unknown")) for run in failed_runs)
+        print(f"[training] {len(failed_runs)} run(s) failed: {failed_tags}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
