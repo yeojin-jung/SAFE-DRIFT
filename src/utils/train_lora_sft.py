@@ -437,6 +437,99 @@ def flatten_trainable_parameters(model) -> torch.Tensor:
     return torch.cat([param.detach().float().cpu().view(-1) for _, param in get_trainable_named_parameters(model)])
 
 
+def trainable_parameter_delta_metrics(model, initial_parameters: torch.Tensor) -> dict[str, float | int]:
+    current_parameters = flatten_trainable_parameters(model)
+    delta = current_parameters - initial_parameters
+    numel = int(delta.numel())
+    norm = float(delta.norm().item()) if numel else 0.0
+    max_abs = float(delta.abs().max().item()) if numel else 0.0
+    return {
+        "final_trainable_parameter_count": numel,
+        "final_trainable_parameter_delta_l2_norm": norm,
+        "final_trainable_parameter_delta_l2_norm_per_sqrt_param": norm / math.sqrt(numel) if numel else 0.0,
+        "final_trainable_parameter_delta_max_abs": max_abs,
+    }
+
+
+def active_lora_adapter_names(module) -> list[str]:
+    active = getattr(module, "active_adapters", None)
+    if callable(active):
+        active = active()
+    if active is None:
+        active = getattr(module, "active_adapter", None)
+        if callable(active):
+            active = active()
+    if isinstance(active, str):
+        names = [active]
+    elif active is None:
+        names = []
+    else:
+        try:
+            names = list(active)
+        except TypeError:
+            names = []
+    if not names and hasattr(module, "lora_A"):
+        names = list(getattr(module, "lora_A").keys())
+    return [str(name) for name in names]
+
+
+def lora_delta_weight(module, adapter_name: str) -> torch.Tensor:
+    if hasattr(module, "get_delta_weight"):
+        return module.get_delta_weight(adapter_name)
+    if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
+        raise ValueError("module does not expose LoRA delta weights")
+    lora_a = getattr(module, "lora_A")[adapter_name].weight
+    lora_b = getattr(module, "lora_B")[adapter_name].weight
+    scaling = getattr(module, "scaling", {}).get(adapter_name, 1.0)
+    delta = (lora_b @ lora_a) * float(scaling)
+    if bool(getattr(module, "fan_in_fan_out", False)):
+        delta = delta.T
+    return delta
+
+
+@torch.no_grad()
+def lora_model_delta_metrics(model) -> dict[str, float | int | list[dict[str, str]]]:
+    total_sq_norm = 0.0
+    total_numel = 0
+    max_abs = 0.0
+    module_count = 0
+    adapter_delta_count = 0
+    skipped: list[dict[str, str]] = []
+
+    for module_name, module in model.named_modules():
+        has_lora_delta = hasattr(module, "get_delta_weight") or (hasattr(module, "lora_A") and hasattr(module, "lora_B"))
+        if not has_lora_delta:
+            continue
+        module_had_delta = False
+        for adapter_name in active_lora_adapter_names(module):
+            try:
+                delta = lora_delta_weight(module, adapter_name).detach().float()
+            except Exception as exc:
+                skipped.append({"module": module_name, "adapter": adapter_name, "error": str(exc)})
+                continue
+            if delta.numel() == 0:
+                continue
+            total_sq_norm += float(delta.square().sum().item())
+            max_abs = max(max_abs, float(delta.abs().max().item()))
+            total_numel += int(delta.numel())
+            adapter_delta_count += 1
+            module_had_delta = True
+        if module_had_delta:
+            module_count += 1
+
+    norm = math.sqrt(total_sq_norm)
+    return {
+        "final_model_weight_delta_l2_norm": norm,
+        "final_model_weight_delta_l2_norm_per_sqrt_param": norm / math.sqrt(total_numel) if total_numel else 0.0,
+        "final_model_weight_delta_max_abs": max_abs,
+        "final_model_weight_delta_parameter_count": total_numel,
+        "final_model_weight_delta_module_count": module_count,
+        "final_model_weight_delta_adapter_count": adapter_delta_count,
+        "final_model_weight_delta_skipped_module_count": len(skipped),
+        "final_model_weight_delta_skipped_modules": skipped[:20],
+    }
+
+
 def flatten_trainable_gradients(model) -> torch.Tensor:
     grads = []
     for _, param in get_trainable_named_parameters(model):
@@ -1095,6 +1188,24 @@ def main() -> None:
                 )
             )
             append_jsonl(metrics_path, {"type": "benchmark_base", **base_eval_metrics})
+        if args.evaluator not in {"none", "bias_disentangle"} and eval_records:
+            target_base_metrics = evaluate_records_with_config(
+                evaluator_name=args.evaluator,
+                model=base_model,
+                tokenizer=tokenizer,
+                records=eval_records,
+                device=accelerator.device,
+                max_examples=args.eval_max_examples,
+                max_new_tokens=args.generation_max_new_tokens,
+                add_bos_token=args.add_bos_token,
+                humaneval_num_samples=args.humaneval_num_samples,
+                humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
+                humaneval_temperature=args.humaneval_temperature,
+                humaneval_top_p=args.humaneval_top_p,
+            )
+            prefixed_target_base = {f"base_target_{key}": value for key, value in target_base_metrics.items()}
+            base_eval_metrics.update(prefixed_target_base)
+            append_jsonl(metrics_path, {"type": "base_target_evaluation", **prefixed_target_base})
         ood_evaluator = args.ood_evaluator or args.evaluator
         if args.evaluate_base_ood and ood_evaluator not in {"none", "bias_disentangle"} and ood_eval_records:
             ood_metrics = evaluate_records_with_config(
@@ -1624,6 +1735,13 @@ def main() -> None:
         if reference_eval_loss is not None:
             summary["reference_test_loss"] = reference_eval_loss
             summary["reference_eval_loss"] = reference_eval_loss
+        unwrapped_model = accelerator.unwrap_model(model)
+        parameter_change_metrics = {
+            **trainable_parameter_delta_metrics(unwrapped_model, theta0),
+            **lora_model_delta_metrics(unwrapped_model),
+        }
+        summary.update(parameter_change_metrics)
+        append_jsonl(metrics_path, {"type": "final_parameter_change", **parameter_change_metrics})
         if args.skip_final_evaluation:
             summary["final_evaluation_skipped"] = True
             save_json(summary_path, summary)
@@ -1651,6 +1769,10 @@ def main() -> None:
                 prefix = "ood_"
                 base_prefix = "base_ood_"
                 delta_prefix = "ood_delta_"
+            elif key.startswith("target_"):
+                prefix = "target_"
+                base_prefix = "base_target_"
+                delta_prefix = "target_delta_"
             else:
                 continue
             metric_name = key.removeprefix(prefix)
