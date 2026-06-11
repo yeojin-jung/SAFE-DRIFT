@@ -121,11 +121,13 @@ def clean_text(value: Any) -> str:
 
 
 def load_hf_dataset(repo: str, *args: Any, split: str, **kwargs: Any):
+    kwargs.setdefault("trust_remote_code", True)
     try:
         return load_dataset(repo, *args, split=split, **kwargs)
     except Exception as exc:
-        if "trust_remote_code=True" in str(exc) and "trust_remote_code" not in kwargs:
-            return load_dataset(repo, *args, split=split, trust_remote_code=True, **kwargs)
+        if "trust_remote_code=True" in str(exc):
+            kwargs["trust_remote_code"] = True
+            return load_dataset(repo, *args, split=split, **kwargs)
         raise RuntimeError(f"Failed to load {repo!r} split={split!r} args={args}: {exc}") from exc
 
 
