@@ -12,6 +12,14 @@ data:
   reference_hf_label: stereotype,anti-stereotype
   reference_hf_format: instruction
 
+subset_percentages: [5.0, 15.0]
+
+splits:
+  candidate_adam_warmup: 0.03
+  candidate_selection: 0.97
+  target: [0.34, 0.33, 0.33]
+  reference: [0.5, 0.5]
+
 model_variants:
   - name: olmo7b_gradient_equals_ft
     gradient_model: allenai/OLMo-2-1124-7B
@@ -22,13 +30,40 @@ model_variants:
     finetune_model: allenai/OLMo-2-1124-7B-Instruct
     enabled: true
 
+selection:
+  lora_r: 2
+  lora_alpha: 4
+  lora_dropout: 0.0
+  lora_target_modules: ["q_proj"]
+  max_seq_len: 1024
+  selector_feature_method: low_rank
+  selector_preconditioner: adam
+  adam_beta2: 0.999
+  adam_eps: 1.0e-8
+  adam_warmup_steps: 0.03
+  low_rank_delta: 0.01
+  low_rank_delta_task: 0.01
+  reference_fisher_max_examples: 1024
+  validation_gradient_max_examples: 256
+
+safe:
+  epsilon: 1.0
+  rho_values: [0.1, 0.3, 1.0, 3.0]
+
 training:
+  train_max_seq_length: 1024
   train_lora_r: 16
   train_lora_alpha: 16
   train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  learning_rate: 2.0e-4
+  lr_scheduler_type: linear
+  max_grad_norm: 1.0
+  num_train_epochs: 1.0
 
 evaluation:
   evaluator: humaneval
+  generation_max_new_tokens: 128
+  validation_gradient_max_examples: 256
   humaneval_num_samples: 10
   humaneval_pass_at_ks: [1, 10]
   humaneval_temperature: 0.8
