@@ -25,6 +25,7 @@ class CandidateScore:
 class SafeSubsetSelectionResult:
     selected_indices: list[int]
     selected_candidates: list[Any]
+    selection_weights: list[float]
     safe_update: dict[str, float | str | torch.Tensor]
     subset_update: torch.Tensor
     subset_gradient: torch.Tensor
@@ -41,6 +42,8 @@ class SafeSubsetSelectionResult:
     predicted_target_gain: float
     candidate_scores: list[CandidateScore]
     shortlist_indices: list[int]
+    solver_status: str
+    optimization_trace: list[dict[str, float | int | str | bool | None]]
 
 
 def _as_fisher_tensor(reference: torch.Tensor, fisher) -> torch.Tensor:
@@ -62,30 +65,33 @@ def _whiten_vectors(
     vectors: torch.Tensor,
     fisher,
     geometry: str,
+    alpha: float = 0.0,
     clamp_min: float = 1.0e-8,
 ) -> torch.Tensor:
     """
     Apply the square-root metric transform.
 
     If geometry == "euclidean", this is the identity.
-    If geometry == "reference", this applies F_R^{1/2}.
+    If geometry == "reference", this applies (F_R + alpha I)^{1/2}.
 
     vectors can be shape [d] or [n, d].
     """
     if geometry not in {"euclidean", "reference"}:
         raise ValueError("geometry must be one of: euclidean, reference.")
+    if alpha < 0.0:
+        raise ValueError("alpha must be non-negative.")
 
     if geometry == "euclidean":
         return vectors
 
     fisher_t = _as_fisher_tensor(vectors[-1] if vectors.ndim == 2 else vectors, fisher)
     if fisher_t.ndim == 1:
-        sqrt_fisher = fisher_t.clamp_min(clamp_min).sqrt()
+        sqrt_fisher = (fisher_t.clamp_min(0.0) + float(alpha)).clamp_min(clamp_min).sqrt()
         return vectors * sqrt_fisher if vectors.ndim == 1 else vectors * sqrt_fisher.unsqueeze(0)
 
     fisher_sym = 0.5 * (fisher_t + fisher_t.T)
     evals, evecs = torch.linalg.eigh(fisher_sym)
-    evals = evals.clamp_min(clamp_min).sqrt()
+    evals = (evals.clamp_min(0.0) + float(alpha)).clamp_min(clamp_min).sqrt()
     sqrt_fisher = (evecs * evals.unsqueeze(0)) @ evecs.T
     if vectors.ndim == 1:
         return sqrt_fisher @ vectors
@@ -239,6 +245,459 @@ def _greedy_marginal_selection(
     return selected
 
 
+def _constraint_tolerance(budget: float | None, tolerance: float) -> float:
+    if budget is None:
+        return 0.0
+    return max(1.0e-12, abs(float(budget)) * float(tolerance))
+
+
+def _trace_diagnostics(
+    *,
+    objective: float,
+    reference_cost: float,
+    norm_cost: float,
+    reference_budget: float | None,
+    norm_budget: float | None,
+    feasibility_tolerance: float,
+) -> dict[str, float | bool | None]:
+    reference_tol = _constraint_tolerance(reference_budget, feasibility_tolerance)
+    norm_tol = _constraint_tolerance(norm_budget, feasibility_tolerance)
+    return {
+        "approximation_error": math.sqrt(max(0.0, 2.0 * float(objective))),
+        "approximation_error_squared": max(0.0, 2.0 * float(objective)),
+        "reference_budget": reference_budget,
+        "reference_budget_ratio": (
+            None
+            if reference_budget is None
+            else float(reference_cost) / max(float(reference_budget), 1.0e-30)
+        ),
+        "reference_budget_satisfied": (
+            None
+            if reference_budget is None
+            else bool(float(reference_cost) <= float(reference_budget) + reference_tol)
+        ),
+        "norm_budget": norm_budget,
+        "norm_budget_ratio": (
+            None if norm_budget is None else float(norm_cost) / max(float(norm_budget), 1.0e-30)
+        ),
+        "norm_budget_satisfied": (
+            None
+            if norm_budget is None
+            else bool(float(norm_cost) <= float(norm_budget) + norm_tol)
+        ),
+    }
+
+
+def _selected_prefix_trace(
+    *,
+    atoms: torch.Tensor,
+    atoms_match: torch.Tensor,
+    delta_match: torch.Tensor,
+    atoms_reference: torch.Tensor,
+    selected_indices: list[int],
+    selection_weights: list[float],
+    reference_budget: float | None,
+    epsilon: float | None,
+    feasibility_tolerance: float,
+) -> list[dict[str, float | int | str | bool | None]]:
+    """Audit each prefix of a selector that does not enforce constraints internally."""
+    norm_budget = None if epsilon is None else 0.5 * float(epsilon) * float(epsilon)
+    current_update = torch.zeros_like(atoms[0])
+    current_match = torch.zeros_like(delta_match)
+    current_reference = torch.zeros_like(atoms_reference[0])
+    initial_objective = float(0.5 * torch.dot(delta_match, delta_match).item())
+    trace: list[dict[str, float | int | str | bool | None]] = [
+        {
+            "iteration": 0,
+            "action": "start",
+            "selected_count": 0,
+            "weight_sum": 0.0,
+            "objective": initial_objective,
+            "reference_cost": 0.0,
+            "norm_cost": 0.0,
+            **_trace_diagnostics(
+                objective=initial_objective,
+                reference_cost=0.0,
+                norm_cost=0.0,
+                reference_budget=reference_budget,
+                norm_budget=norm_budget,
+                feasibility_tolerance=feasibility_tolerance,
+            ),
+        }
+    ]
+    weight_sum = 0.0
+    for iteration, (candidate_index, weight) in enumerate(
+        zip(selected_indices, selection_weights, strict=True),
+        start=1,
+    ):
+        weight = float(weight)
+        weight_sum += weight
+        current_update = current_update + weight * atoms[candidate_index]
+        current_match = current_match + weight * atoms_match[candidate_index]
+        current_reference = (
+            current_reference + weight * atoms_reference[candidate_index]
+        )
+        residual = current_match - delta_match
+        objective = float(0.5 * torch.dot(residual, residual).item())
+        reference_cost = float(
+            0.5 * torch.dot(current_reference, current_reference).item()
+        )
+        norm_cost = float(0.5 * torch.dot(current_update, current_update).item())
+        trace.append(
+            {
+                "iteration": iteration,
+                "action": "prefix_add",
+                "candidate_index": int(candidate_index),
+                "candidate_weight": weight,
+                "selected_count": iteration,
+                "weight_sum": weight_sum,
+                "objective": objective,
+                "reference_cost": reference_cost,
+                "norm_cost": norm_cost,
+                **_trace_diagnostics(
+                    objective=objective,
+                    reference_cost=reference_cost,
+                    norm_cost=norm_cost,
+                    reference_budget=reference_budget,
+                    norm_budget=norm_budget,
+                    feasibility_tolerance=feasibility_tolerance,
+                ),
+            }
+        )
+    return trace
+
+
+def _constrained_greedy_selection(
+    *,
+    atoms: torch.Tensor,
+    atoms_match: torch.Tensor,
+    delta_match: torch.Tensor,
+    atoms_reference: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    subset_budget: int,
+    reference_budget: float | None,
+    epsilon: float | None,
+    feasibility_tolerance: float,
+    objective_tolerance: float,
+    swap_passes: int,
+) -> tuple[list[int], list[dict[str, float | int | str | bool | None]], str]:
+    """Forward greedy with hard update budgets and an at-most-k cardinality."""
+    if subset_budget > int(candidate_indices.numel()):
+        raise ValueError("subset_budget cannot exceed the shortlist size.")
+    if swap_passes < 0:
+        raise ValueError("swap_passes must be non-negative.")
+
+    norm_budget = None if epsilon is None else 0.5 * float(epsilon) * float(epsilon)
+    reference_tol = _constraint_tolerance(reference_budget, feasibility_tolerance)
+    norm_tol = _constraint_tolerance(norm_budget, feasibility_tolerance)
+
+    selected: list[int] = []
+    remaining = candidate_indices.clone()
+    current_update = torch.zeros_like(atoms[0])
+    current_match = torch.zeros_like(delta_match)
+    current_reference = torch.zeros_like(atoms_reference[0])
+    current_objective = float(0.5 * torch.dot(delta_match, delta_match).item())
+    trace: list[dict[str, float | int | str | bool | None]] = [
+        {
+            "iteration": 0,
+            "action": "start",
+            "selected_count": 0,
+            "objective": current_objective,
+            "reference_cost": 0.0,
+            "norm_cost": 0.0,
+            **_trace_diagnostics(
+                objective=current_objective,
+                reference_cost=0.0,
+                norm_cost=0.0,
+                reference_budget=reference_budget,
+                norm_budget=norm_budget,
+                feasibility_tolerance=feasibility_tolerance,
+            ),
+        }
+    ]
+    status = "budget_reached"
+
+    for iteration in range(1, subset_budget + 1):
+        if remaining.numel() == 0:
+            status = "shortlist_exhausted"
+            break
+
+        trial_match = current_match.unsqueeze(0) + atoms_match[remaining]
+        residual = trial_match - delta_match.unsqueeze(0)
+        objectives = 0.5 * torch.sum(residual.square(), dim=1)
+
+        trial_reference = current_reference.unsqueeze(0) + atoms_reference[remaining]
+        reference_costs = 0.5 * torch.sum(trial_reference.square(), dim=1)
+        trial_updates = current_update.unsqueeze(0) + atoms[remaining]
+        norm_costs = 0.5 * torch.sum(trial_updates.square(), dim=1)
+
+        feasible = torch.ones_like(objectives, dtype=torch.bool)
+        if reference_budget is not None:
+            feasible &= reference_costs <= float(reference_budget) + reference_tol
+        if norm_budget is not None:
+            feasible &= norm_costs <= float(norm_budget) + norm_tol
+
+        feasible_positions = torch.nonzero(feasible, as_tuple=False).flatten()
+        if feasible_positions.numel() == 0:
+            status = "no_feasible_addition"
+            break
+
+        feasible_objectives = objectives[feasible_positions]
+        best_feasible_position = int(torch.argmin(feasible_objectives).item())
+        best_pos = int(feasible_positions[best_feasible_position].item())
+        best_objective = float(objectives[best_pos].item())
+        if best_objective >= current_objective - float(objective_tolerance):
+            status = "no_improving_feasible_addition"
+            break
+
+        best_idx = int(remaining[best_pos].item())
+        selected.append(best_idx)
+        current_update = trial_updates[best_pos]
+        current_match = trial_match[best_pos]
+        current_reference = trial_reference[best_pos]
+        current_objective = best_objective
+        trace.append(
+            {
+                "iteration": iteration,
+                "action": "add",
+                "candidate_index": best_idx,
+                "selected_count": len(selected),
+                "objective": current_objective,
+                "reference_cost": float(reference_costs[best_pos].item()),
+                "norm_cost": float(norm_costs[best_pos].item()),
+                "feasible_candidate_count": int(feasible_positions.numel()),
+                **_trace_diagnostics(
+                    objective=current_objective,
+                    reference_cost=float(reference_costs[best_pos].item()),
+                    norm_cost=float(norm_costs[best_pos].item()),
+                    reference_budget=reference_budget,
+                    norm_budget=norm_budget,
+                    feasibility_tolerance=feasibility_tolerance,
+                ),
+            }
+        )
+
+        mask = torch.ones_like(remaining, dtype=torch.bool)
+        mask[best_pos] = False
+        remaining = remaining[mask]
+    else:
+        status = "budget_reached"
+
+    # A small feasible swap search repairs common forward-greedy mistakes
+    # without changing the selected cardinality.
+    for swap_pass in range(swap_passes):
+        if not selected or remaining.numel() == 0:
+            break
+        best_swap: tuple[int, int, int, float, torch.Tensor, torch.Tensor, torch.Tensor, float, float] | None = None
+        for selected_pos, removed_idx in enumerate(selected):
+            base_update = current_update - atoms[removed_idx]
+            base_match = current_match - atoms_match[removed_idx]
+            base_reference = current_reference - atoms_reference[removed_idx]
+
+            trial_match = base_match.unsqueeze(0) + atoms_match[remaining]
+            residual = trial_match - delta_match.unsqueeze(0)
+            objectives = 0.5 * torch.sum(residual.square(), dim=1)
+            trial_reference = base_reference.unsqueeze(0) + atoms_reference[remaining]
+            reference_costs = 0.5 * torch.sum(trial_reference.square(), dim=1)
+            trial_updates = base_update.unsqueeze(0) + atoms[remaining]
+            norm_costs = 0.5 * torch.sum(trial_updates.square(), dim=1)
+
+            feasible = torch.ones_like(objectives, dtype=torch.bool)
+            if reference_budget is not None:
+                feasible &= reference_costs <= float(reference_budget) + reference_tol
+            if norm_budget is not None:
+                feasible &= norm_costs <= float(norm_budget) + norm_tol
+            improving = feasible & (objectives < current_objective - float(objective_tolerance))
+            positions = torch.nonzero(improving, as_tuple=False).flatten()
+            if positions.numel() == 0:
+                continue
+            local_pos = int(positions[torch.argmin(objectives[positions])].item())
+            local_objective = float(objectives[local_pos].item())
+            if best_swap is None or local_objective < best_swap[3]:
+                best_swap = (
+                    selected_pos,
+                    removed_idx,
+                    local_pos,
+                    local_objective,
+                    trial_updates[local_pos],
+                    trial_match[local_pos],
+                    trial_reference[local_pos],
+                    float(reference_costs[local_pos].item()),
+                    float(norm_costs[local_pos].item()),
+                )
+
+        if best_swap is None:
+            break
+
+        selected_pos, removed_idx, remaining_pos, current_objective, current_update, current_match, current_reference, ref_cost, norm_cost = best_swap
+        added_idx = int(remaining[remaining_pos].item())
+        selected[selected_pos] = added_idx
+        remaining[remaining_pos] = removed_idx
+        trace.append(
+            {
+                "iteration": len(trace),
+                "action": "swap",
+                "swap_pass": swap_pass + 1,
+                "removed_candidate_index": removed_idx,
+                "candidate_index": added_idx,
+                "selected_count": len(selected),
+                "objective": current_objective,
+                "reference_cost": ref_cost,
+                "norm_cost": norm_cost,
+                **_trace_diagnostics(
+                    objective=current_objective,
+                    reference_cost=ref_cost,
+                    norm_cost=norm_cost,
+                    reference_budget=reference_budget,
+                    norm_budget=norm_budget,
+                    feasibility_tolerance=feasibility_tolerance,
+                ),
+            }
+        )
+
+    return selected, trace, status
+
+
+def _radially_enforce_relaxed_budgets(
+    weights: torch.Tensor,
+    atoms: torch.Tensor,
+    atoms_reference: torch.Tensor,
+    subset_budget: int,
+    reference_budget: float | None,
+    epsilon: float | None,
+) -> torch.Tensor:
+    """Remove small numerical violations while preserving box feasibility."""
+    weights = weights.clamp(min=0.0, max=1.0)
+    scales = [1.0]
+    weight_sum = float(weights.sum().item())
+    if weight_sum > float(subset_budget):
+        scales.append(float(subset_budget) / weight_sum)
+
+    reference_update = weights @ atoms_reference
+    reference_cost = float(0.5 * torch.dot(reference_update, reference_update).item())
+    if reference_budget is not None and reference_cost > float(reference_budget) and reference_cost > 0.0:
+        scales.append(math.sqrt(float(reference_budget) / reference_cost))
+
+    update = weights @ atoms
+    norm_cost = float(0.5 * torch.dot(update, update).item())
+    norm_budget = None if epsilon is None else 0.5 * float(epsilon) * float(epsilon)
+    if norm_budget is not None and norm_cost > norm_budget and norm_cost > 0.0:
+        scales.append(math.sqrt(norm_budget / norm_cost))
+
+    scale = min(scales)
+    if scale < 1.0:
+        weights = weights * (scale * (1.0 - 1.0e-9))
+    return weights
+
+
+def _relaxed_selection(
+    *,
+    atoms: torch.Tensor,
+    atoms_match: torch.Tensor,
+    delta_match: torch.Tensor,
+    atoms_reference: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    subset_budget: int,
+    reference_budget: float | None,
+    epsilon: float | None,
+    cvx_solver: str,
+    weight_threshold: float,
+) -> tuple[list[int], list[float], list[dict[str, float | int | str | bool | None]], str]:
+    """Solve the continuous w in [0, 1] convex relaxation with CVXPY."""
+    try:
+        import cvxpy as cp
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError(
+            "solver='relaxed' requires cvxpy and clarabel; install requirements/lambda-train.txt."
+        ) from exc
+
+    shortlist = candidate_indices.detach().cpu()
+    atoms_short = atoms[shortlist].detach().double().cpu()
+    match_short = atoms_match[shortlist].detach().double().cpu()
+    reference_short = atoms_reference[shortlist].detach().double().cpu()
+    delta_np = delta_match.detach().double().cpu().numpy()
+
+    num_candidates = int(shortlist.numel())
+    weights_var = cp.Variable(num_candidates)
+    match_update = match_short.numpy().T @ weights_var
+    objective = cp.Minimize(0.5 * cp.sum_squares(match_update - delta_np))
+    constraints = [
+        weights_var >= 0.0,
+        weights_var <= 1.0,
+        cp.sum(weights_var) <= float(subset_budget),
+    ]
+    if reference_budget is not None:
+        constraints.append(
+            0.5 * cp.sum_squares(reference_short.numpy().T @ weights_var)
+            <= float(reference_budget)
+        )
+    if epsilon is not None:
+        constraints.append(cp.sum_squares(atoms_short.numpy().T @ weights_var) <= float(epsilon) ** 2)
+
+    requested_solver = str(cvx_solver).upper()
+    installed = {str(name).upper() for name in cp.installed_solvers()}
+    if requested_solver not in installed:
+        raise RuntimeError(
+            f"Requested relaxed solver {requested_solver!r} is not installed. "
+            f"Available CVXPY solvers: {sorted(installed)}"
+        )
+
+    problem = cp.Problem(objective, constraints)
+    problem.solve(solver=requested_solver, verbose=False)
+    acceptable_statuses = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
+    if problem.status not in acceptable_statuses or weights_var.value is None:
+        raise RuntimeError(f"Relaxed SAFE selector failed with CVXPY status {problem.status!r}.")
+
+    weights = torch.as_tensor(
+        np.asarray(weights_var.value, dtype=np.float64),
+        device=atoms_short.device,
+        dtype=atoms_short.dtype,
+    )
+    weights = torch.where(weights > float(weight_threshold), weights, torch.zeros_like(weights))
+    weights = _radially_enforce_relaxed_budgets(
+        weights=weights,
+        atoms=atoms_short,
+        atoms_reference=reference_short,
+        subset_budget=subset_budget,
+        reference_budget=reference_budget,
+        epsilon=epsilon,
+    )
+    support_positions = torch.nonzero(weights > 0.0, as_tuple=False).flatten()
+    selected_indices = [int(shortlist[pos].item()) for pos in support_positions]
+    selected_weights = [float(weights[pos].item()) for pos in support_positions]
+
+    update = weights @ atoms_short
+    reference_update = weights @ reference_short
+    match_update_t = weights @ match_short
+    objective_value = float(0.5 * torch.sum((match_update_t - delta_match).square()).item())
+    reference_cost = float(0.5 * torch.dot(reference_update, reference_update).item())
+    norm_cost = float(0.5 * torch.dot(update, update).item())
+    norm_budget = None if epsilon is None else 0.5 * float(epsilon) * float(epsilon)
+    trace: list[dict[str, float | int | str | bool | None]] = [
+        {
+            "iteration": 0,
+            "action": "relaxed_solution",
+            "selected_count": len(selected_indices),
+            "weight_sum": float(weights.sum().item()),
+            "objective": objective_value,
+            "reference_cost": reference_cost,
+            "norm_cost": norm_cost,
+            "cvxpy_objective": float(problem.value),
+            "cvxpy_status": str(problem.status),
+            **_trace_diagnostics(
+                objective=objective_value,
+                reference_cost=reference_cost,
+                norm_cost=norm_cost,
+                reference_budget=reference_budget,
+                norm_budget=norm_budget,
+                feasibility_tolerance=1.0e-6,
+            ),
+        }
+    ]
+    return selected_indices, selected_weights, trace, str(problem.status)
+
+
 def select_safe_subset_from_gradients(
     candidate_gradients: torch.Tensor,
     candidates: list[Any],
@@ -254,10 +713,15 @@ def select_safe_subset_from_gradients(
     shortlist_size: int | None = None,
     average_by_budget: bool = True,
     preconditioner: torch.Tensor | None = None,
+    feasibility_tolerance: float = 1.0e-6,
+    objective_tolerance: float = 1.0e-12,
+    greedy_swap_passes: int = 1,
+    relaxed_cvx_solver: str = "CLARABEL",
+    relaxed_weight_threshold: float = 1.0e-8,
     clamp_min: float = 1.0e-8,
 ) -> SafeSubsetSelectionResult:
     """
-    Select an exact-cardinality binary subset to match the continuous safe update.
+    Select candidate updates to match the continuous safe update.
 
     Supported solvers:
       - solver="rank":
@@ -270,12 +734,20 @@ def select_safe_subset_from_gradients(
           the true marginal of the whitened quadratic objective. This is a
           practical approximation to the exact binary objective.
 
+      - solver="constrained_greedy":
+          run at-most-k forward greedy, accepting only additions that satisfy
+          the reference and norm budgets and improve the matching objective.
+
+      - solver="relaxed":
+          solve the convex relaxation with 0 <= w_i <= 1, sum_i w_i <= k, and
+          the same reference and norm budgets. Fractional weights are returned.
+
     Supported geometries:
       - geometry="euclidean":
             min_w 0.5 ||A w - Delta*||_2^2
       - geometry="reference":
-            min_w 0.5 (A w - Delta*)^T F_R (A w - Delta*)
-        implemented by whitening with F_R^{1/2}.
+            min_w 0.5 (A w - Delta*)^T (F_R + alpha I) (A w - Delta*)
+        implemented by whitening with (F_R + alpha I)^{1/2}.
 
     If average_by_budget is True, atoms are u_i / k and the selected update is
         (1 / k) sum_{i in S} u_i.
@@ -298,8 +770,15 @@ def select_safe_subset_from_gradients(
         raise ValueError("learning_rate must be positive.")
     if geometry not in {"euclidean", "reference"}:
         raise ValueError("geometry must be one of: euclidean, reference.")
-    if solver not in {"rank", "greedy_marginal"}:
-        raise ValueError("solver must be one of: rank, greedy_marginal.")
+    supported_solvers = {"rank", "greedy_marginal", "constrained_greedy", "relaxed"}
+    if solver not in supported_solvers:
+        raise ValueError(f"solver must be one of: {', '.join(sorted(supported_solvers))}.")
+    if feasibility_tolerance < 0.0:
+        raise ValueError("feasibility_tolerance must be non-negative.")
+    if objective_tolerance < 0.0:
+        raise ValueError("objective_tolerance must be non-negative.")
+    if relaxed_weight_threshold < 0.0:
+        raise ValueError("relaxed_weight_threshold must be non-negative.")
 
     candidate_gradients = candidate_gradients.float()
     target_gradient = target_gradient.float()
@@ -338,18 +817,28 @@ def select_safe_subset_from_gradients(
         subset_budget=subset_budget,
         average_by_budget=average_by_budget,
     )
+    resolved_alpha = float(safe_update["alpha"])
 
     atoms_white = _whiten_vectors(
         vectors=atoms,
         fisher=fisher,
         geometry=geometry,
+        alpha=resolved_alpha if geometry == "reference" else 0.0,
         clamp_min=clamp_min,
     )
     delta_white = _whiten_vectors(
         vectors=target_delta,
         fisher=fisher,
         geometry=geometry,
+        alpha=resolved_alpha if geometry == "reference" else 0.0,
         clamp_min=clamp_min,
+    )
+    atoms_reference = _whiten_vectors(
+        vectors=atoms,
+        fisher=fisher,
+        geometry="reference",
+        alpha=0.0,
+        clamp_min=0.0,
     )
 
     rank_scores_t, singleton_objectives_t = _compute_rank_scores(
@@ -378,14 +867,59 @@ def select_safe_subset_from_gradients(
         dtype=torch.long,
     )
 
+    optimization_trace: list[dict[str, float | int | str | bool | None]] = []
+    solver_status = "completed"
     if solver == "rank":
         selected_indices = shortlist_indices[:subset_budget]
-    else:
+        selection_weights = [1.0] * len(selected_indices)
+    elif solver == "greedy_marginal":
         selected_indices = _greedy_marginal_selection(
             atoms_white=atoms_white,
             delta_white=delta_white,
             candidate_indices=shortlist_tensor,
             subset_budget=subset_budget,
+        )
+        selection_weights = [1.0] * len(selected_indices)
+    elif solver == "constrained_greedy":
+        selected_indices, optimization_trace, solver_status = _constrained_greedy_selection(
+            atoms=atoms,
+            atoms_match=atoms_white,
+            delta_match=delta_white,
+            atoms_reference=atoms_reference,
+            candidate_indices=shortlist_tensor,
+            subset_budget=subset_budget,
+            reference_budget=cost_c,
+            epsilon=epsilon,
+            feasibility_tolerance=feasibility_tolerance,
+            objective_tolerance=objective_tolerance,
+            swap_passes=greedy_swap_passes,
+        )
+        selection_weights = [1.0] * len(selected_indices)
+    else:
+        selected_indices, selection_weights, optimization_trace, solver_status = _relaxed_selection(
+            atoms=atoms,
+            atoms_match=atoms_white,
+            delta_match=delta_white,
+            atoms_reference=atoms_reference,
+            candidate_indices=shortlist_tensor,
+            subset_budget=subset_budget,
+            reference_budget=cost_c,
+            epsilon=epsilon,
+            cvx_solver=relaxed_cvx_solver,
+            weight_threshold=relaxed_weight_threshold,
+        )
+
+    if solver in {"rank", "greedy_marginal"}:
+        optimization_trace = _selected_prefix_trace(
+            atoms=atoms,
+            atoms_match=atoms_white,
+            delta_match=delta_white,
+            atoms_reference=atoms_reference,
+            selected_indices=selected_indices,
+            selection_weights=selection_weights,
+            reference_budget=cost_c,
+            epsilon=epsilon,
+            feasibility_tolerance=feasibility_tolerance,
         )
 
     selected_tensor = torch.tensor(
@@ -393,8 +927,16 @@ def select_safe_subset_from_gradients(
         device=candidate_gradients.device,
         dtype=torch.long,
     )
-    selected_atoms = atoms[selected_tensor]
-    subset_update = selected_atoms.sum(dim=0)
+    if selected_indices:
+        selected_atoms = atoms[selected_tensor]
+        selected_weights_t = torch.tensor(
+            selection_weights,
+            device=candidate_gradients.device,
+            dtype=atoms.dtype,
+        )
+        subset_update = selected_weights_t @ selected_atoms
+    else:
+        subset_update = torch.zeros_like(target_delta)
 
     if average_by_budget:
         # atoms already include the 1 / k factor, so subset_update is already
@@ -406,12 +948,16 @@ def select_safe_subset_from_gradients(
     final_costs = compute_update_costs(subset_update, fisher)
     predicted_target_gain = -torch.dot(target_gradient, subset_update)
 
-    residual_white = atoms_white[selected_tensor].sum(dim=0) - delta_white
+    if selected_indices:
+        residual_white = selected_weights_t @ atoms_white[selected_tensor] - delta_white
+    else:
+        residual_white = -delta_white
     objective_value = 0.5 * torch.dot(residual_white, residual_white)
 
     return SafeSubsetSelectionResult(
         selected_indices=selected_indices,
         selected_candidates=[candidates[idx] for idx in selected_indices],
+        selection_weights=selection_weights,
         safe_update=safe_update,
         subset_update=subset_update,
         subset_gradient=subset_gradient,
@@ -428,4 +974,6 @@ def select_safe_subset_from_gradients(
         predicted_target_gain=float(predicted_target_gain.item()),
         candidate_scores=ranking,
         shortlist_indices=shortlist_indices,
+        solver_status=solver_status,
+        optimization_trace=optimization_trace,
     )

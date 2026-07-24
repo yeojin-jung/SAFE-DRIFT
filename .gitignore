@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 
 outputs/
+analysis_outputs/
 checkpoints/
 wandb/
 data/setting_2_medical/prepared/

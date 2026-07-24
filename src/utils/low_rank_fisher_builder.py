@@ -1220,11 +1220,16 @@ def build_low_rank_safe_inputs_from_gradient_rows(
     include_basis: bool = True,
     task_candidate_compute_in_float64: bool = False,
     candidate_projection_chunk_rows: int = 512,
+    task_basis_gradient: torch.Tensor | None = None,
 ) -> LowRankSafeInputs:
     """Build selector-ready low-rank tensors from row-oriented gradients.
 
     This uses the residualize-first task construction and avoids materializing
-    the large column-major candidate matrix ``[d, N_C]``.
+    the large column-major candidate matrix ``[d, N_C]``. Candidate rows may
+    represent either raw gradients or optimizer update directions. When they
+    are update directions, ``task_basis_gradient`` should contain the target
+    update direction used to build the residual task block; ``g_T`` remains
+    the raw target objective gradient.
     """
     if reference_grad_rows.ndim != 2:
         raise ValueError("reference_grad_rows must have shape [N_R, d].")
@@ -1236,10 +1241,18 @@ def build_low_rank_safe_inputs_from_gradient_rows(
         raise ValueError("reference_grad_rows width must match g_T dimension.")
     if candidate_grad_rows.shape[1] != g_T.numel():
         raise ValueError("candidate_grad_rows width must match g_T dimension.")
+    if task_basis_gradient is not None:
+        if task_basis_gradient.ndim != 1 or task_basis_gradient.numel() != g_T.numel():
+            raise ValueError("task_basis_gradient must be a 1D tensor matching g_T.")
 
     reference_grad_rows = reference_grad_rows.detach().to(dtype=torch.float32, device="cpu")
     g_T = g_T.detach().to(dtype=torch.float32, device="cpu")
     candidate_grad_rows = candidate_grad_rows.detach().to(dtype=torch.float32, device="cpu")
+    task_basis_gradient = (
+        g_T
+        if task_basis_gradient is None
+        else task_basis_gradient.detach().to(dtype=torch.float32, device="cpu")
+    )
 
     ref_lr = build_reference_low_rank(
         reference_grad_rows=reference_grad_rows,
@@ -1260,7 +1273,7 @@ def build_low_rank_safe_inputs_from_gradient_rows(
     tc_lr: Optional[TaskCandidateLowRank] = None
     if auto_task_rank or (requested_k_add is not None and requested_k_add > 0):
         tc_lr = build_task_candidate_low_rank_from_rows(
-            g_T=g_T,
+            g_T=task_basis_gradient,
             candidate_grad_rows=candidate_grad_rows,
             U_R=ref_lr.U_R,
             K_add=requested_k_add,
@@ -1347,6 +1360,7 @@ def _gradient_rows_from_examples(
     max_examples: Optional[int] = None,
     show_progress: bool = True,
     desc: str = "Computing full gradients",
+    elementwise_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if max_examples is None:
         subset = list(examples)
@@ -1359,8 +1373,13 @@ def _gradient_rows_from_examples(
 
     model.eval()
     iterator = tqdm(subset, desc=desc) if show_progress else subset
-    rows: List[torch.Tensor] = []
-    for example in iterator:
+    rows: Optional[torch.Tensor] = None
+    scale_cpu = (
+        None
+        if elementwise_scale is None
+        else elementwise_scale.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
+    )
+    for row_idx, example in enumerate(iterator):
         gradient = compute_per_example_gradient(
             model=model,
             tokenizer=tokenizer,
@@ -1369,8 +1388,31 @@ def _gradient_rows_from_examples(
             max_seq_len=max_seq_len,
             use_lora=use_lora,
         )
-        rows.append(gradient.detach().to(dtype=torch.float32, device="cpu"))
-    return torch.stack(rows, dim=0)
+        gradient_cpu = gradient.detach().to(dtype=torch.float32, device="cpu")
+        if scale_cpu is not None:
+            if int(scale_cpu.numel()) != int(gradient_cpu.numel()):
+                raise ValueError(
+                    f"elementwise_scale width does not match gradients for {desc}: "
+                    f"expected {gradient_cpu.numel()}, got {scale_cpu.numel()}."
+                )
+            gradient_cpu.mul_(scale_cpu)
+        if rows is None:
+            # Preallocate to avoid torch.stack temporarily duplicating the
+            # full per-example gradient matrix at the end of collection.
+            rows = torch.empty(
+                (len(subset), int(gradient_cpu.numel())),
+                dtype=torch.float32,
+                device="cpu",
+            )
+        elif int(gradient_cpu.numel()) != int(rows.shape[1]):
+            raise ValueError(
+                f"Gradient width changed while {desc}: "
+                f"expected {rows.shape[1]}, got {gradient_cpu.numel()}."
+            )
+        rows[row_idx].copy_(gradient_cpu.reshape(-1))
+    if rows is None:
+        raise RuntimeError(f"Failed to collect gradients for: {desc}")
+    return rows
 
 
 def project_examples_to_basis(
@@ -1384,6 +1426,7 @@ def project_examples_to_basis(
     use_lora: bool = True,
     show_progress: bool = True,
     desc: str = "Projecting gradients into low-rank basis",
+    elementwise_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Project per-example gradients into an existing low-rank basis.
 
@@ -1398,6 +1441,13 @@ def project_examples_to_basis(
     from .extract_gradients import compute_per_example_gradient
 
     basis_cpu = basis.detach().to(dtype=torch.float32, device="cpu")
+    scale_cpu = (
+        None
+        if elementwise_scale is None
+        else elementwise_scale.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
+    )
+    if scale_cpu is not None and int(scale_cpu.numel()) != int(basis_cpu.shape[0]):
+        raise ValueError("elementwise_scale width must match the low-rank basis height.")
     num_examples = len(examples)
     out = torch.empty((num_examples, int(basis_cpu.shape[1])), dtype=torch.float32, device="cpu")
 
@@ -1412,9 +1462,51 @@ def project_examples_to_basis(
             max_seq_len=max_seq_len,
             use_lora=use_lora,
         )
-        projected = gradient.detach().to(dtype=torch.float32, device="cpu") @ basis_cpu
+        gradient_cpu = gradient.detach().to(dtype=torch.float32, device="cpu")
+        if scale_cpu is not None:
+            gradient_cpu.mul_(scale_cpu)
+        projected = gradient_cpu @ basis_cpu
         out[row_idx].copy_(projected)
     return out
+
+
+def reference_fisher_weights_from_examples(
+    examples: Sequence[dict[str, Any]],
+    *,
+    max_examples: Optional[int] = None,
+) -> torch.Tensor | None:
+    subset = list(examples) if max_examples is None else list(examples[: max(0, int(max_examples))])
+    raw_weights = [example.get("reference_fisher_weight") for example in subset]
+    if not raw_weights or all(weight is None for weight in raw_weights):
+        return None
+    if any(weight is None for weight in raw_weights):
+        raise ValueError(
+            "reference_fisher_weight must be present on every reference example "
+            "or on none of them."
+        )
+    weights = torch.tensor([float(weight) for weight in raw_weights], dtype=torch.float32)
+    if bool((weights < 0.0).any()):
+        raise ValueError("reference_fisher_weight values must be nonnegative.")
+    total = float(weights.sum().item())
+    if total <= 0.0:
+        raise ValueError("reference_fisher_weight values must have positive total mass.")
+    return weights / total
+
+
+def apply_reference_fisher_weights(
+    reference_grad_rows: torch.Tensor,
+    weights: torch.Tensor | None,
+) -> torch.Tensor:
+    if weights is None:
+        return reference_grad_rows
+    if reference_grad_rows.ndim != 2:
+        raise ValueError("reference_grad_rows must have shape [N_R, d].")
+    if weights.ndim != 1 or int(weights.numel()) != int(reference_grad_rows.shape[0]):
+        raise ValueError("reference_fisher_weight length must match the reference row count.")
+    # build_reference_low_rank divides S S^T by N_R. Scaling row i by
+    # sqrt(N_R * w_i) makes the resulting Fisher exactly sum_i w_i g_i g_i^T.
+    scale = torch.sqrt(weights.to(dtype=reference_grad_rows.dtype) * float(reference_grad_rows.shape[0]))
+    return reference_grad_rows * scale.unsqueeze(1)
 
 
 def compute_low_rank_safe_inputs_from_examples(
@@ -1448,8 +1540,15 @@ def compute_low_rank_safe_inputs_from_examples(
     include_full_gradients: bool = False,
     include_basis: bool = True,
     candidate_projection_chunk_rows: int = 512,
+    update_preconditioner: torch.Tensor | None = None,
 ) -> LowRankSafeInputs:
-    """Example-driven entry point for the residualize-first low-rank pipeline."""
+    """Example-driven entry point for the residualize-first low-rank pipeline.
+
+    ``update_preconditioner`` is an optional diagonal parameter-space map.
+    When provided, candidate features and the residual task basis are built
+    from preconditioned update directions before projection. Reference Fisher
+    construction and the target objective gradient remain unpreconditioned.
+    """
     reference_grad_rows = _gradient_rows_from_examples(
         model=model,
         tokenizer=tokenizer,
@@ -1460,6 +1559,14 @@ def compute_low_rank_safe_inputs_from_examples(
         max_examples=max_reference_examples,
         show_progress=show_progress,
         desc="Computing reference full gradients",
+    )
+    reference_weights = reference_fisher_weights_from_examples(
+        references,
+        max_examples=max_reference_examples,
+    )
+    reference_grad_rows = apply_reference_fisher_weights(
+        reference_grad_rows,
+        reference_weights,
     )
     target_rows = _gradient_rows_from_examples(
         model=model,
@@ -1484,7 +1591,14 @@ def compute_low_rank_safe_inputs_from_examples(
         max_examples=max_candidate_examples,
         show_progress=show_progress,
         desc="Computing candidate full gradients",
+        elementwise_scale=update_preconditioner,
     )
+    task_basis_gradient = None
+    if update_preconditioner is not None:
+        preconditioner_cpu = update_preconditioner.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
+        if int(preconditioner_cpu.numel()) != int(g_T.numel()):
+            raise ValueError("update_preconditioner width must match the trainable parameter dimension.")
+        task_basis_gradient = g_T * preconditioner_cpu
 
     out = build_low_rank_safe_inputs_from_gradient_rows(
         reference_grad_rows=reference_grad_rows,
@@ -1506,6 +1620,7 @@ def compute_low_rank_safe_inputs_from_examples(
         include_basis=include_basis,
         task_candidate_compute_in_float64=False,
         candidate_projection_chunk_rows=candidate_projection_chunk_rows,
+        task_basis_gradient=task_basis_gradient,
     )
 
     del reference_grad_rows
@@ -1524,6 +1639,7 @@ def compute_low_rank_safe_inputs_from_examples(
             use_lora=use_lora,
             show_progress=show_progress,
             desc="Projecting full candidate gradients into low-rank basis",
+            elementwise_scale=update_preconditioner,
         )
     if save_target_features:
         U_K = out.common_basis.U_K.to(dtype=torch.float32, device="cpu")

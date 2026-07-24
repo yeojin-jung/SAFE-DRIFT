@@ -1,0 +1,285 @@
+experiment:
+  id: setting_2_medqa_medmcqa_selector_trajectory_sweep_v3
+  name: "Setting 2: gradient-calibrated selector, KL baseline, and trajectory-constraint sweep"
+
+repeats:
+  - repeat_index: 0
+    repeat_seed: 42
+    run_seed: 42
+    target_sample_seed: 42
+    repeat_tag: repeat_00
+  - repeat_index: 1
+    repeat_seed: 43
+    run_seed: 43
+    target_sample_seed: 43
+    repeat_tag: repeat_01
+  - repeat_index: 2
+    repeat_seed: 44
+    run_seed: 44
+    target_sample_seed: 44
+    repeat_tag: repeat_02
+  - repeat_index: 3
+    repeat_seed: 45
+    run_seed: 45
+    target_sample_seed: 45
+    repeat_tag: repeat_03
+  - repeat_index: 4
+    repeat_seed: 46
+    run_seed: 46
+    target_sample_seed: 46
+    repeat_tag: repeat_04
+
+seed: "{run_seed}"
+output_root: /lambda/nfs/mem/safe-drift/outputs
+shared_cache_root: /lambda/nfs/mem/safe-drift/shared_cache
+shared_cache_namespace: setting_2_medqa_medmcqa_safe_full_grid_v1
+
+prepare:
+  - command:
+      - python
+      - scripts/data/prepare_medical_data.py
+      - --out
+      - /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}
+      - --seed
+      - "{repeat_seed}"
+      - --target-sample-seed
+      - "{target_sample_seed}"
+      - --max-target-train
+      - "256"
+      - --max-candidates
+      - "2000"
+      - --max-candidate-validation
+      - "0"
+      - --max-candidate-test
+      - "0"
+      - --max-reference-per-dataset
+      - "256"
+      - --max-reference-validation-per-dataset
+      - "128"
+      - --max-reference-test-per-dataset
+      - "256"
+      - --candidate-source
+      - medmcqa
+      - --reference-datasets
+      - ifeval,truthfulqa,bbq
+      - --eval-only-datasets
+      - gsm8k,mmlu_non_medical
+      - --overwrite
+
+data:
+  candidate_file: /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}/candidate_pool.jsonl
+  target_file: /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}/target_train.jsonl
+  validation_file: /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}/target_dev.jsonl
+  eval_file: /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}/target_test.jsonl
+  ood_eval_file: /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}/reference_eval/mcq_ood_test.jsonl
+  reference_file: /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}/reference_prompts.jsonl
+  reference_validation_file: /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}/reference_validation.jsonl
+  reference_test_file: /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}/reference_test.jsonl
+
+model_variants:
+  - name: olmo7b_instruct
+    gradient_model: allenai/OLMo-2-1124-7B-Instruct
+    finetune_model: allenai/OLMo-2-1124-7B-Instruct
+    enabled: true
+
+run_baselines: true
+baseline_variants:
+  - name: random
+    selector: random
+  - name: dsir
+    selector: dsir
+  - name: less_no_kl
+    selector: less
+    training:
+      kl_regularization_lambda: 0.0
+  - name: less_kl_0.01
+    selector: less
+    training:
+      kl_regularization_lambda: 0.01
+  - name: less_kl_0.1
+    selector: less
+    training:
+      kl_regularization_lambda: 0.1
+  - name: less_kl_1.0
+    selector: less
+    training:
+      kl_regularization_lambda: 1.0
+  - name: prismatic_no_kl
+    selector: prismatic
+    training:
+      kl_regularization_lambda: 0.0
+  - name: prismatic_kl_0.01
+    selector: prismatic
+    training:
+      kl_regularization_lambda: 0.01
+  - name: prismatic_kl_0.1
+    selector: prismatic
+    training:
+      kl_regularization_lambda: 0.1
+  - name: prismatic_kl_1.0
+    selector: prismatic
+    training:
+      kl_regularization_lambda: 1.0
+
+subset_percentages: [25.6]
+
+splits:
+  target: [1.0, 0.0, 0.0]
+  target_seed: "{run_seed}"
+  reference: [1.0, 0.0]
+  reference_seed: "{run_seed}"
+
+selection:
+  selector_feature_method: low_rank
+  selector_preconditioner: adam
+  adam_selection_mode: post_projection
+  preconditioner_split_seed: "{run_seed}"
+  selector_projection_seed: "{run_seed}"
+  save_selected_artifacts: true
+  save_all_target_features: true
+  less_similarity: cosine
+  selection_torch_dtype: bf16
+  max_seq_len: 1024
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  adam_warmup_steps: 0.1
+  low_rank_builder_alpha: 1.0e-3
+  low_rank_delta: 0.01
+  low_rank_delta_task: 0.01
+  reference_fisher_max_examples: 256
+  validation_gradient_max_examples: 256
+  low_rank_target_max_examples: 256
+  low_rank_candidate_max_examples: 256
+  low_rank_candidate_projection_chunk_rows: 128
+  safe_geometry: reference
+  safe_solver: greedy_marginal
+  safe_learning_rate: 2.0e-4
+  safe_epsilon_calibration_samples: 64
+  safe_epsilon_calibration_seed: "{run_seed}"
+  compute_validation_gradient: true
+  compute_reference_fisher: true
+  resume_completed_runs: true
+
+rank_grid:
+  - name: KR64_KT16
+    K_R: 64
+    K_T: 16
+    K: 80
+
+safe:
+  # Disable the fixed epsilon inherited from pipeline_defaults.yaml. Every
+  # variant below uses a multiplier of the random-subset calibration epsilon0.
+  epsilon: null
+  variants:
+    - name: safe_legacy_adam_greedy
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      adam_selection_mode: post_projection
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+      epsilon_multipliers: [0.5, 1.0, 2.0]
+      rho_values: []
+      gamma_values: [0.01, 0.1, 1.0]
+      kl_regularization_lambda: 0.0
+    - name: safe_hard_feasible_greedy
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      adam_selection_mode: post_projection
+      safe_geometry: reference
+      safe_solver: constrained_greedy
+      epsilon_multipliers: [0.5, 1.0, 2.0]
+      rho_values: []
+      gamma_values: [0.01, 0.1, 1.0]
+      kl_regularization_lambda: 0.0
+    - name: safe_fractional_relaxation
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      adam_selection_mode: post_projection
+      safe_geometry: reference
+      safe_solver: relaxed
+      epsilon_multipliers: [0.5, 1.0, 2.0]
+      rho_values: []
+      gamma_values: [0.01, 0.1, 1.0]
+      kl_regularization_lambda: 0.0
+    - name: safe_corrected_adam_greedy
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      adam_selection_mode: precondition_before_projection
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+      epsilon_multipliers: [0.5, 1.0, 2.0]
+      rho_values: []
+      gamma_values: [0.01, 0.1, 1.0]
+      kl_regularization_lambda: 0.0
+    - name: safe_corrected_adam_cumulative_trajectory
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      adam_selection_mode: precondition_before_projection
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+      epsilon_multipliers: [1.0, 5.0]
+      rho_values: [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0]
+      gamma_values: []
+      safe_training_constraint_mode: cumulative_line_search
+      kl_regularization_lambda: 0.0
+    - name: safe_corrected_adam_equal_allocation
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      adam_selection_mode: precondition_before_projection
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+      epsilon_multipliers: [1.0, 5.0]
+      rho_values: [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0]
+      gamma_values: []
+      safe_training_constraint_mode: equal_allocation
+      kl_regularization_lambda: 0.0
+
+training:
+  train_lora_r: 16
+  train_lora_alpha: 32
+  train_lora_dropout: 0.05
+  train_torch_dtype: bf16
+  train_lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  train_max_seq_length: 1024
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  lr_scheduler_type: linear
+  max_grad_norm: 1.0
+  num_train_epochs: 2.0
+  logging_steps: 1
+  eval_steps: 0
+  save_steps: 0
+  gradient_checkpointing: true
+  kl_regularization_lambda: 0.0
+  kl_reference_max_examples: 64
+  trajectory_eval_steps: 4
+  trajectory_reference_max_examples: 32
+  trajectory_target_max_examples: 64
+  trajectory_generation_eval_steps: 16
+  trajectory_generation_max_examples: 16
+  trajectory_generation_max_new_tokens: 64
+
+evaluation:
+  evaluator: medqa
+  ood_evaluator: mcq_ood
+  reference_evaluator: medical_reference
+  trajectory_target_evaluator: medqa
+  trajectory_reference_evaluator: medical_reference
+  trajectory_instruction_file: /lambda/nfs/mem/safe-drift/data/setting_2/prepared_{repeat_tag}/reference_eval/ifeval_validation.jsonl
+  trajectory_instruction_evaluator: ifeval_proxy
+  generation_max_new_tokens: 64
+  ood_generation_max_new_tokens: 8
+  reference_generation_max_new_tokens: 64
+  eval_max_examples: 256
+  benchmark_evals: ["gsm8k"]
+  benchmark_max_examples: 64
+  compute_entanglement_metrics: true
+  entanglement_target_sample_size: 128
+  entanglement_selected_csv_max_rows: 5000
+  run_entanglement_analysis: false

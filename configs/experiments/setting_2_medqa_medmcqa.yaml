@@ -1,8 +1,25 @@
 experiment:
-  id: setting_2_medqa_target_medmcqa_candidates_truthfulqa_bbq_eval
-  name: "Setting 2: MedQA target / MedMCQA candidates / TruthfulQA+BBQ eval"
+  id: setting_2_medqa_medmcqa_legacy
+  name: "Setting 2 legacy reproduction: MedQA / MedMCQA / TruthfulQA+BBQ+IFEval"
 
-repeat_seeds: [42]
+repeats:
+  - repeat_index: 0
+    repeat_seed: 42
+    run_seed: 42
+    target_sample_seed: 42
+    repeat_tag: repeat_00
+  - repeat_index: 1
+    repeat_seed: 43
+    run_seed: 2045
+    target_sample_seed: 10049
+    repeat_tag: repeat_01
+  - repeat_index: 2
+    repeat_seed: 44
+    run_seed: 4048
+    target_sample_seed: 20056
+    repeat_tag: repeat_02
+
+seed: "{run_seed}"
 
 prepare:
   - command:
@@ -11,38 +28,39 @@ prepare:
       - --out
       - data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}
       - --seed
-      - "{repeat_seed}"
+      - "13"
+      - --target-sample-seed
+      - "{target_sample_seed}"
       - --max-target-train
       - "256"
       - --max-candidates
-      - "10000"
+      - "2000"
       - --max-candidate-validation
-      - "256"
+      - "0"
       - --max-candidate-test
-      - "256"
+      - "0"
       - --max-reference-per-dataset
       - "256"
       - --max-reference-validation-per-dataset
-      - "128"
+      - "0"
       - --max-reference-test-per-dataset
-      - "128"
+      - "0"
       - --candidate-source
       - medmcqa
       - --reference-datasets
-      - truthfulqa,bbq
+      - ifeval,truthfulqa,bbq
+      - --legacy-reuse-reference-for-eval
       - --overwrite
 
 data:
   candidate_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/candidate_pool.jsonl
-  candidate_validation_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/candidate_validation.jsonl
-  candidate_test_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/candidate_test.jsonl
   target_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/target_train.jsonl
   validation_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/target_dev.jsonl
   eval_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/target_test.jsonl
   ood_eval_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_test.jsonl
   reference_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_prompts.jsonl
-  reference_validation_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_validation.jsonl
-  reference_test_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_test.jsonl
+  reference_validation_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_eval/ifeval.jsonl
+  reference_test_file: data/setting_2_medqa_medmcqa_truthfulqa_bbq/prepared_{repeat_tag}/reference_eval/ifeval.jsonl
 
 model_variants:
   - name: olmo7b_instruct_gradient_equals_ft
@@ -63,19 +81,19 @@ model_variants:
     enabled: false
 
 baseline_selectors: ["random", "dsir", "less", "prismatic"]
-subset_percentages: [5.12]
+subset_percentages: [25.6]
 
 splits:
   target: [1.0, 0.0, 0.0]
-  target_seed: "{repeat_seed}"
-  reference: [1.0, 0.0]
-  reference_seed: "{repeat_seed}"
+  target_seed: "{run_seed}"
+  reference: [0.7, 0.3]
+  reference_seed: 42
 
 selection:
   selector_feature_method: low_rank
   selector_preconditioner: adam
-  preconditioner_split_seed: "{repeat_seed}"
-  selector_projection_seed: "{repeat_seed}"
+  preconditioner_split_seed: 42
+  selector_projection_seed: 13
   save_selected_artifacts: true
   less_similarity: cosine
   selection_torch_dtype: bf16
@@ -84,6 +102,7 @@ selection:
   lora_alpha: 16
   lora_dropout: 0.0
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  adam_warmup_steps: 0.1
   low_rank_builder_alpha: 1.0e-3
   low_rank_delta: 0.01
   low_rank_delta_task: 0.01
@@ -106,8 +125,8 @@ rank_grid:
 
 safe:
   epsilon: 1.0
-  epsilon_values: [1.0, 1.0e-4]
-  rho_values: [1.0e-8, 1.0e-6, 1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0, 100.0]
+  epsilon_values: [1.0]
+  rho_values: [1.0e-5, 1.0e-2, 1.0]
   variants:
     - name: safe_reference_precondadam
       selector_feature_method: low_rank
@@ -119,6 +138,38 @@ safe:
       selector_preconditioner: sgd
       safe_geometry: reference
       safe_solver: greedy_marginal
+    - name: safe_reference_cumulative_precondadam
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+      safe_training_constraint_mode: cumulative_line_search
+    - name: safe_reference_cumulative_precondsgd
+      selector_feature_method: low_rank
+      selector_preconditioner: sgd
+      safe_geometry: reference
+      safe_solver: greedy_marginal
+      safe_training_constraint_mode: cumulative_line_search
+    - name: safe_reference_constrained_precondadam
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      safe_geometry: reference
+      safe_solver: constrained_greedy
+    - name: safe_reference_constrained_precondsgd
+      selector_feature_method: low_rank
+      selector_preconditioner: sgd
+      safe_geometry: reference
+      safe_solver: constrained_greedy
+    - name: safe_reference_relaxed_precondadam
+      selector_feature_method: low_rank
+      selector_preconditioner: adam
+      safe_geometry: reference
+      safe_solver: relaxed
+    - name: safe_reference_relaxed_precondsgd
+      selector_feature_method: low_rank
+      selector_preconditioner: sgd
+      safe_geometry: reference
+      safe_solver: relaxed
     - name: safe_euclidean_precondadam
       selector_feature_method: low_rank
       selector_preconditioner: adam
@@ -162,9 +213,12 @@ training:
 evaluation:
   evaluator: medqa
   ood_evaluator: medical_reference
-  reference_evaluator: loss
-  generation_max_new_tokens: 64
-  compute_entanglement_metrics: true
+  reference_evaluator: ifeval_proxy
+  generation_max_new_tokens: 32
+  ood_generation_max_new_tokens: 64
+  reference_generation_max_new_tokens: 96
+  compute_entanglement_metrics: false
   entanglement_target_sample_size: 128
   entanglement_selected_csv_max_rows: 5000
+  run_entanglement_analysis: false
   benchmark_evals: []

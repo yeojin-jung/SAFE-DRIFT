@@ -5,13 +5,16 @@ import hashlib
 import json
 import math
 import os
+import random
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from peft import LoraConfig, TaskType, get_peft_model
@@ -60,6 +63,27 @@ class TimingResult:
 
 def safe_slug(value: str) -> str:
     return "".join(char if char.isalnum() or char in "._-" else "_" for char in value).strip("_") or "value"
+
+
+def parse_extra_eval_spec(spec: str) -> dict[str, str]:
+    try:
+        name, rest = str(spec).split("=", 1)
+        evaluator, path = rest.split(":", 1)
+    except ValueError as exc:
+        raise ValueError(
+            "Extra eval specs must use NAME=EVALUATOR:/path/to/file.jsonl syntax; "
+            f"got {spec!r}."
+        ) from exc
+    name = safe_slug(name)
+    evaluator = evaluator.strip()
+    path = path.strip()
+    if not name or not evaluator or not path:
+        raise ValueError(f"Invalid extra eval spec: {spec!r}")
+    return {"name": name, "evaluator": evaluator, "file": path}
+
+
+def parse_extra_eval_specs(specs: list[str] | tuple[str, ...] | None) -> list[dict[str, str]]:
+    return [parse_extra_eval_spec(spec) for spec in (specs or [])]
 
 
 def concat_messages(messages: list[dict[str, str]], tokenizer, add_bos_token: bool = False) -> str:
@@ -160,11 +184,19 @@ class DataCollatorForSupervisedDataset:
         )
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
         attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
-        return {
+        batch = {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": attention_mask,
         }
+        example_weights = [instance.get("example_weight") for instance in instances]
+        if any(weight is not None for weight in example_weights):
+            if not all(weight is not None for weight in example_weights):
+                raise ValueError("A training batch cannot mix weighted and unweighted examples.")
+            batch["example_weights"] = torch.stack(
+                [weight.float().reshape(()) for weight in example_weights if weight is not None]
+            )
+        return batch
 
 
 def tokenize_records(records: list[dict[str, Any]], tokenizer, max_seq_length: int, add_bos_token: bool) -> list[dict[str, torch.Tensor]]:
@@ -177,8 +209,294 @@ def tokenize_records(records: list[dict[str, Any]], tokenizer, max_seq_length: i
             add_bos_token=add_bos_token,
         )
         if has_supervised_targets(encoded):
+            if "safe_training_weight" in record:
+                weight = float(record["safe_training_weight"])
+                if not math.isfinite(weight) or weight < 0.0:
+                    raise ValueError(f"safe_training_weight must be finite and non-negative, got {weight}.")
+                encoded["example_weight"] = torch.tensor(weight, dtype=torch.float32)
             tokenized_records.append(encoded)
     return tokenized_records
+
+
+def weighted_causal_lm_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    example_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Apply example weights while preserving the ordinary token-mean loss at weight one."""
+    if example_weights.ndim != 1 or example_weights.shape[0] != labels.shape[0]:
+        raise ValueError("example_weights must have shape [batch_size].")
+    shift_logits = logits[..., :-1, :].contiguous().float()
+    shift_labels = labels[..., 1:].contiguous()
+    valid = shift_labels.ne(-100)
+    token_losses = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.shape[-1]),
+        shift_labels.view(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view_as(shift_labels)
+    weighted_losses = token_losses * valid * example_weights.to(token_losses.dtype).unsqueeze(1)
+    return weighted_losses.sum() / valid.sum().clamp_min(1)
+
+
+def constraint_audit(
+    *,
+    cost: float,
+    budget: float | None,
+    prefix: str,
+    relative_tolerance: float = 1.0e-6,
+    absolute_tolerance: float = 1.0e-12,
+) -> dict[str, float | bool | None]:
+    if budget is None:
+        return {
+            f"{prefix}_budget": None,
+            f"{prefix}_budget_ratio": None,
+            f"{prefix}_budget_gap": None,
+            f"{prefix}_budget_satisfied": None,
+        }
+    budget = float(budget)
+    tolerance = max(float(absolute_tolerance), abs(budget) * float(relative_tolerance))
+    return {
+        f"{prefix}_budget": budget,
+        f"{prefix}_budget_ratio": float(cost) / max(abs(budget), absolute_tolerance),
+        f"{prefix}_budget_gap": budget - float(cost),
+        f"{prefix}_budget_satisfied": bool(float(cost) <= budget + tolerance),
+    }
+
+
+def largest_scale_for_quadratic(
+    *,
+    quadratic: float,
+    linear: float,
+    constant: float,
+    tolerance: float = 1.0e-12,
+) -> float:
+    """Largest s in [0, 1] with quadratic * s^2 + linear * s + constant <= 0."""
+    quadratic = max(0.0, float(quadratic))
+    linear = float(linear)
+    constant = float(constant)
+    tolerance = float(tolerance)
+    if quadratic + linear + constant <= tolerance:
+        return 1.0
+    if quadratic <= tolerance:
+        if abs(linear) <= tolerance:
+            return 1.0 if constant <= tolerance else 0.0
+        boundary = (tolerance - constant) / linear
+        if linear > 0.0:
+            return max(0.0, min(1.0, boundary))
+        return 1.0 if boundary <= 1.0 else 0.0
+
+    shifted_constant = constant - tolerance
+    discriminant = linear * linear - 4.0 * quadratic * shifted_constant
+    if discriminant < 0.0:
+        return 0.0
+    root_radius = math.sqrt(max(0.0, discriminant))
+    lower_root = (-linear - root_radius) / (2.0 * quadratic)
+    upper_root = (-linear + root_radius) / (2.0 * quadratic)
+    feasible_lower = max(0.0, lower_root)
+    feasible_upper = min(1.0, upper_root)
+    if feasible_lower > feasible_upper:
+        return 0.0
+    return max(0.0, feasible_upper)
+
+
+def cumulative_safe_scale(
+    *,
+    displacement: torch.Tensor,
+    proposal: torch.Tensor,
+    fisher: torch.Tensor | None,
+    rho: float | None,
+    epsilon: float | None,
+    tolerance: float = 1.0e-12,
+) -> tuple[float, dict[str, float | str | bool | None]]:
+    """Line-search an optimizer proposal in the cumulative safe set anchored at theta0."""
+    displacement = displacement.detach().float()
+    proposal = proposal.detach().float()
+    proposed_displacement = displacement + proposal
+    scales = {"unit_interval": 1.0}
+
+    if rho is not None and fisher is None:
+        raise ValueError("A Fisher tensor is required when rho is constrained.")
+
+    proposed_reference_cost = None
+    current_reference_cost = None
+    if fisher is not None:
+        fisher = fisher.detach().to(device=proposal.device, dtype=torch.float32)
+        fisher_proposal = fisher * proposal
+        current_reference_cost = float(
+            0.5 * torch.dot(displacement, fisher * displacement).item()
+        )
+        proposed_reference_cost = float(
+            0.5 * torch.dot(proposed_displacement, fisher * proposed_displacement).item()
+        )
+    if rho is not None:
+        scales["reference"] = largest_scale_for_quadratic(
+            quadratic=float(0.5 * torch.dot(proposal, fisher_proposal).item()),
+            linear=float(torch.dot(displacement, fisher_proposal).item()),
+            constant=current_reference_cost - float(rho),
+            tolerance=tolerance,
+        )
+
+    current_norm_cost = float(0.5 * torch.dot(displacement, displacement).item())
+    proposed_norm_cost = float(
+        0.5 * torch.dot(proposed_displacement, proposed_displacement).item()
+    )
+    if epsilon is not None:
+        scales["norm"] = largest_scale_for_quadratic(
+            quadratic=float(0.5 * torch.dot(proposal, proposal).item()),
+            linear=float(torch.dot(displacement, proposal).item()),
+            constant=current_norm_cost - 0.5 * float(epsilon) ** 2,
+            tolerance=tolerance,
+        )
+
+    active_constraint = min(scales, key=scales.get)
+    scale = min(scales.values())
+    if scale < 1.0:
+        scale *= 1.0 - 1.0e-7
+    accepted_displacement = displacement + scale * proposal
+    accepted_reference_cost = None
+    if fisher is not None:
+        accepted_reference_cost = float(
+            0.5 * torch.dot(accepted_displacement, fisher * accepted_displacement).item()
+        )
+    accepted_norm_cost = float(
+        0.5 * torch.dot(accepted_displacement, accepted_displacement).item()
+    )
+    rejected_proposal = (1.0 - scale) * proposal
+    projection_fisher_error = None
+    if fisher is not None:
+        projection_fisher_error = float(
+            0.5 * torch.dot(rejected_proposal, fisher * rejected_proposal).item()
+        )
+    diagnostics: dict[str, float | str | bool | None] = {
+        "trajectory_projection_scale": float(scale),
+        "trajectory_projection_active": bool(scale < 1.0 - 1.0e-8),
+        "trajectory_projection_active_constraint": (
+            active_constraint if scale < 1.0 - 1.0e-8 else "none"
+        ),
+        "trajectory_proposal_norm": float(proposal.norm().item()),
+        "trajectory_projection_l2_error": float(rejected_proposal.norm().item()),
+        "trajectory_projection_fisher_error": projection_fisher_error,
+        "current_cumulative_reference_cost_before_update": current_reference_cost,
+        "proposed_cumulative_reference_cost": proposed_reference_cost,
+        "accepted_cumulative_reference_cost": accepted_reference_cost,
+        "current_cumulative_norm_cost_before_update": current_norm_cost,
+        "proposed_cumulative_norm_cost": proposed_norm_cost,
+        "accepted_cumulative_norm_cost": accepted_norm_cost,
+    }
+    return float(scale), diagnostics
+
+
+def safe_training_update_scale(
+    *,
+    mode: str,
+    displacement: torch.Tensor,
+    proposal: torch.Tensor,
+    fisher: torch.Tensor | None,
+    rho: float | None,
+    epsilon: float | None,
+    max_steps: int,
+    tolerance: float = 1.0e-12,
+) -> tuple[float, dict[str, float | str | bool | None]]:
+    if mode not in {"cumulative_line_search", "equal_allocation"}:
+        raise ValueError(f"Unsupported SAFE training constraint mode: {mode!r}")
+
+    global_scale, diagnostics = cumulative_safe_scale(
+        displacement=displacement,
+        proposal=proposal,
+        fisher=fisher,
+        rho=rho,
+        epsilon=epsilon,
+        tolerance=tolerance,
+    )
+    diagnostics["safe_training_constraint_mode"] = mode
+    if mode == "cumulative_line_search":
+        return global_scale, diagnostics
+
+    horizon = max(1, int(max_steps))
+    step_rho = None if rho is None else float(rho) / float(horizon * horizon)
+    step_epsilon = None if epsilon is None else float(epsilon) / float(horizon)
+    step_scale, step_diagnostics = cumulative_safe_scale(
+        displacement=torch.zeros_like(displacement),
+        proposal=proposal,
+        fisher=fisher,
+        rho=step_rho,
+        epsilon=step_epsilon,
+        tolerance=tolerance,
+    )
+    scale = min(global_scale, step_scale)
+    accepted_displacement = displacement + scale * proposal
+    accepted_update = scale * proposal
+    rejected_proposal = (1.0 - scale) * proposal
+    active_constraint = "global_" + str(
+        diagnostics["trajectory_projection_active_constraint"]
+    )
+    if step_scale <= global_scale and step_scale < 1.0 - 1.0e-8:
+        active_constraint = "equal_allocation_" + str(
+            step_diagnostics["trajectory_projection_active_constraint"]
+        )
+
+    diagnostics.update(
+        {
+            "trajectory_projection_scale": float(scale),
+            "trajectory_projection_active": bool(scale < 1.0 - 1.0e-8),
+            "trajectory_projection_active_constraint": (
+                active_constraint if scale < 1.0 - 1.0e-8 else "none"
+            ),
+            "trajectory_projection_l2_error": float(rejected_proposal.norm().item()),
+            "accepted_cumulative_norm_cost": float(
+                0.5 * torch.dot(accepted_displacement, accepted_displacement).item()
+            ),
+            "equal_allocation_horizon": horizon,
+            "equal_allocation_step_rho": step_rho,
+            "equal_allocation_step_epsilon": step_epsilon,
+            "equal_allocation_proposal_scale": float(step_scale),
+            "equal_allocation_accepted_update_norm_cost": float(
+                0.5 * torch.dot(accepted_update, accepted_update).item()
+            ),
+        }
+    )
+    if fisher is not None:
+        fisher = fisher.detach().to(device=proposal.device, dtype=torch.float32)
+        diagnostics.update(
+            {
+                "accepted_cumulative_reference_cost": float(
+                    0.5
+                    * torch.dot(
+                        accepted_displacement,
+                        fisher * accepted_displacement,
+                    ).item()
+                ),
+                "trajectory_projection_fisher_error": float(
+                    0.5
+                    * torch.dot(
+                        rejected_proposal,
+                        fisher * rejected_proposal,
+                    ).item()
+                ),
+                "equal_allocation_accepted_update_reference_cost": float(
+                    0.5 * torch.dot(accepted_update, fisher * accepted_update).item()
+                ),
+            }
+        )
+    return float(scale), diagnostics
+
+
+def assign_trainable_parameters_from_flat(model, flat_parameters: torch.Tensor) -> None:
+    offset = 0
+    with torch.no_grad():
+        for _, parameter in get_trainable_named_parameters(model):
+            next_offset = offset + parameter.numel()
+            if next_offset > flat_parameters.numel():
+                raise ValueError("Flat parameter vector is shorter than the trainable parameter set.")
+            parameter.copy_(
+                flat_parameters[offset:next_offset]
+                .view_as(parameter)
+                .to(device=parameter.device, dtype=parameter.dtype)
+            )
+            offset = next_offset
+    if offset != flat_parameters.numel():
+        raise ValueError("Flat parameter vector is longer than the trainable parameter set.")
 
 
 def get_tokenized_cache_path(
@@ -586,6 +904,19 @@ def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -
     return {key: value.to(device) for key, value in batch.items()}
 
 
+def seeded_record_subset(
+    records: list[dict[str, Any]],
+    *,
+    max_examples: int | None,
+    seed: int,
+) -> list[dict[str, Any]]:
+    if max_examples is None or max_examples <= 0 or len(records) <= max_examples:
+        return list(records)
+    indices = list(range(len(records)))
+    random.Random(int(seed)).shuffle(indices)
+    return [records[index] for index in indices[: int(max_examples)]]
+
+
 def compute_average_gradient(
     model,
     tokenizer,
@@ -688,11 +1019,143 @@ def get_or_compute_metric_tensor(
     )
 
 
+def estimate_batch_training_flops(model, batch: dict[str, torch.Tensor]) -> float:
+    """Estimate forward+backward FLOPs using the Transformers convention."""
+    input_batch = {
+        key: value
+        for key, value in batch.items()
+        if key in {"input_ids", "attention_mask", "token_type_ids"}
+    }
+    floating_point_ops = getattr(model, "floating_point_ops", None)
+    if callable(floating_point_ops):
+        try:
+            return float(floating_point_ops(input_batch))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is not None:
+        token_count = int(attention_mask.detach().sum().item())
+    else:
+        token_count = int(batch["input_ids"].numel())
+    parameter_count = sum(int(parameter.numel()) for parameter in model.parameters())
+    return float(6 * token_count * parameter_count)
+
+
+@contextmanager
+def adapters_disabled(model):
+    disable_adapter = getattr(model, "disable_adapter", None)
+    if callable(disable_adapter):
+        with disable_adapter():
+            yield
+        return
+    yield
+
+
+def shifted_supervised_mask(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    labels = batch.get("labels")
+    if labels is not None:
+        mask = labels[:, 1:].ne(-100)
+        if mask.any():
+            return mask
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is not None:
+        return attention_mask[:, 1:].bool()
+    return torch.ones_like(batch["input_ids"][:, 1:], dtype=torch.bool)
+
+
+def token_kl_from_logits(
+    *,
+    adapted_logits: torch.Tensor,
+    base_logits: torch.Tensor,
+    token_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    adapted_log_probs = F.log_softmax(adapted_logits[:, :-1, :].float(), dim=-1)
+    base_log_probs = F.log_softmax(base_logits[:, :-1, :].float(), dim=-1)
+    token_kl = F.kl_div(
+        adapted_log_probs,
+        base_log_probs.exp(),
+        reduction="none",
+        log_target=False,
+    ).sum(dim=-1)
+    mask = token_mask.to(device=token_kl.device, dtype=token_kl.dtype)
+    return (token_kl * mask).sum(), mask.sum()
+
+
+def compute_reference_kl_regularization_loss(
+    model,
+    batch: dict[str, torch.Tensor],
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    unwrapped = accelerator.unwrap_model(model)
+    was_training = bool(model.training)
+    model.eval()
+    model_inputs = {
+        key: value
+        for key, value in batch.items()
+        if key in {"input_ids", "attention_mask", "token_type_ids"}
+    }
+    with torch.no_grad():
+        with adapters_disabled(unwrapped):
+            base_logits = unwrapped(**model_inputs).logits.detach()
+    adapted_logits = model(**model_inputs).logits
+    kl_sum, token_count = token_kl_from_logits(
+        adapted_logits=adapted_logits,
+        base_logits=base_logits,
+        token_mask=shifted_supervised_mask(batch),
+    )
+    if was_training:
+        model.train()
+    return kl_sum / token_count.clamp_min(1.0)
+
+
 @torch.no_grad()
-def evaluate_validation_loss(model, dataloader, accelerator: Accelerator) -> float:
+def evaluate_realized_heldout_kl(
+    model,
+    dataloader,
+    accelerator: Accelerator,
+) -> tuple[float, float]:
+    unwrapped = accelerator.unwrap_model(model)
+    was_training = bool(model.training)
+    model.eval()
+    local_kl_sum = 0.0
+    local_token_count = 0.0
+    estimated_forward_flops = 0.0
+    for batch in dataloader:
+        model_inputs = {
+            key: value
+            for key, value in batch.items()
+            if key in {"input_ids", "attention_mask", "token_type_ids"}
+        }
+        with adapters_disabled(unwrapped):
+            base_logits = unwrapped(**model_inputs).logits
+        adapted_logits = model(**model_inputs).logits
+        kl_sum, token_count = token_kl_from_logits(
+            adapted_logits=adapted_logits,
+            base_logits=base_logits,
+            token_mask=shifted_supervised_mask(batch),
+        )
+        local_kl_sum += float(kl_sum.item())
+        local_token_count += float(token_count.item())
+        estimated_forward_flops += (2.0 / 3.0) * estimate_batch_training_flops(unwrapped, batch)
+    totals = torch.tensor(
+        [local_kl_sum, local_token_count, estimated_forward_flops],
+        dtype=torch.float64,
+        device=accelerator.device,
+    )
+    gathered = accelerator.gather_for_metrics(totals).reshape(-1, 3).sum(dim=0)
+    if was_training:
+        model.train()
+    token_count = max(1.0, float(gathered[1].item()))
+    return float(gathered[0].item()) / token_count, float(gathered[2].item())
+
+
+@torch.no_grad()
+def evaluate_validation_loss_with_flops(model, dataloader, accelerator: Accelerator) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total_batches = 0
+    estimated_forward_flops = 0.0
+    unwrapped = accelerator.unwrap_model(model)
     for batch in dataloader:
         if not batch["labels"].ne(-100).any():
             continue
@@ -701,10 +1164,84 @@ def evaluate_validation_loss(model, dataloader, accelerator: Accelerator) -> flo
         reduced = accelerator.gather_for_metrics(loss.unsqueeze(0))
         total_loss += float(reduced.mean().item())
         total_batches += 1
+        estimated_forward_flops += estimate_batch_training_flops(unwrapped, batch) / 3.0
+    gathered_flops = accelerator.gather_for_metrics(
+        torch.tensor([estimated_forward_flops], dtype=torch.float64, device=accelerator.device)
+    ).sum()
     model.train()
     if total_batches == 0:
-        return 0.0
-    return total_loss / float(total_batches)
+        return 0.0, float(gathered_flops.item())
+    return total_loss / float(total_batches), float(gathered_flops.item())
+
+
+def evaluate_validation_loss(model, dataloader, accelerator: Accelerator) -> float:
+    loss, _ = evaluate_validation_loss_with_flops(model, dataloader, accelerator)
+    return loss
+
+
+def average_ranks(values: list[float]) -> list[float]:
+    order = sorted(range(len(values)), key=lambda index: values[index])
+    ranks = [0.0] * len(values)
+    position = 0
+    while position < len(order):
+        end = position + 1
+        while end < len(order) and values[order[end]] == values[order[position]]:
+            end += 1
+        average_rank = 0.5 * ((position + 1) + end)
+        for ordered_index in order[position:end]:
+            ranks[ordered_index] = average_rank
+        position = end
+    return ranks
+
+
+def spearman_correlation(left: list[float], right: list[float]) -> float | None:
+    pairs = [
+        (float(left_value), float(right_value))
+        for left_value, right_value in zip(left, right)
+        if math.isfinite(float(left_value)) and math.isfinite(float(right_value))
+    ]
+    if len(pairs) < 3:
+        return None
+    left_ranks = average_ranks([pair[0] for pair in pairs])
+    right_ranks = average_ranks([pair[1] for pair in pairs])
+    left_mean = sum(left_ranks) / len(left_ranks)
+    right_mean = sum(right_ranks) / len(right_ranks)
+    numerator = sum(
+        (left_rank - left_mean) * (right_rank - right_mean)
+        for left_rank, right_rank in zip(left_ranks, right_ranks)
+    )
+    left_scale = math.sqrt(sum((rank - left_mean) ** 2 for rank in left_ranks))
+    right_scale = math.sqrt(sum((rank - right_mean) ** 2 for rank in right_ranks))
+    if left_scale == 0.0 or right_scale == 0.0:
+        return None
+    return numerator / (left_scale * right_scale)
+
+
+def trajectory_correlation_summary(points: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    fisher = [float(point["predicted_fisher_cost"]) for point in points]
+    kl = [float(point["realized_heldout_kl"]) for point in points]
+    degradation = [float(point["target_loss_degradation"]) for point in points]
+    performance = [float(point["target_performance_proxy"]) for point in points]
+    summary: dict[str, float | int | None] = {
+        "trajectory_point_count": len(points),
+        "spearman_predicted_fisher_vs_realized_kl": spearman_correlation(fisher, kl),
+        "spearman_realized_kl_vs_target_degradation": spearman_correlation(kl, degradation),
+        "spearman_realized_kl_vs_target_performance": spearman_correlation(kl, performance),
+        "spearman_predicted_fisher_vs_target_degradation": spearman_correlation(fisher, degradation),
+    }
+    optional_pairs = {
+        "spearman_realized_kl_vs_medqa_accuracy": "target_medqa_accuracy",
+        "spearman_realized_kl_vs_reference_degradation": "reference_performance_degradation",
+        "spearman_realized_kl_vs_instruction_degradation": "instruction_performance_degradation",
+    }
+    for output_key, point_key in optional_pairs.items():
+        metric_points = [point for point in points if point_key in point]
+        if metric_points:
+            summary[output_key] = spearman_correlation(
+                [float(point["realized_heldout_kl"]) for point in metric_points],
+                [float(point[point_key]) for point in metric_points],
+            )
+    return summary
 
 
 def prefixed_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
@@ -765,6 +1302,60 @@ def evaluate_named_record_sets(
             add_bos_token=add_bos_token,
         )
         metrics.update({f"{prefix}{key}": value for key, value in evaluator_metrics.items()})
+    return metrics
+
+
+def load_extra_eval_record_sets(args: argparse.Namespace) -> list[dict[str, Any]]:
+    record_sets: list[dict[str, Any]] = []
+    for spec in parse_extra_eval_specs(args.extra_evals):
+        if spec["evaluator"] in {"none", "loss", "bias_disentangle"}:
+            records: list[dict[str, Any]] = []
+        else:
+            records = load_records(spec["file"])
+        record_sets.append({**spec, "records": records})
+    return record_sets
+
+
+def evaluate_extra_record_sets(
+    *,
+    model,
+    tokenizer,
+    device: torch.device,
+    record_sets: list[dict[str, Any]],
+    max_examples: int | None,
+    max_new_tokens: int,
+    add_bos_token: bool,
+    prefix: str,
+    humaneval_num_samples: int,
+    humaneval_pass_at_ks: tuple[int, ...],
+    humaneval_temperature: float,
+    humaneval_top_p: float,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for item in record_sets:
+        records = item.get("records") or []
+        if not records:
+            continue
+        evaluator_metrics = evaluate_records_with_config(
+            evaluator_name=str(item["evaluator"]),
+            model=model,
+            tokenizer=tokenizer,
+            records=records,
+            device=device,
+            max_examples=max_examples,
+            max_new_tokens=max_new_tokens,
+            add_bos_token=add_bos_token,
+            humaneval_num_samples=humaneval_num_samples,
+            humaneval_pass_at_ks=humaneval_pass_at_ks,
+            humaneval_temperature=humaneval_temperature,
+            humaneval_top_p=humaneval_top_p,
+        )
+        metrics.update(
+            {
+                f"{prefix}{item['name']}_{key}": value
+                for key, value in evaluator_metrics.items()
+            }
+        )
     return metrics
 
 
@@ -853,6 +1444,7 @@ def run_required_final_evaluations(
     ood_eval_records: list[dict[str, Any]],
     reference_validation_records: list[dict[str, Any]],
     reference_eval_records: list[dict[str, Any]],
+    extra_eval_record_sets: list[dict[str, Any]],
     final_dir: Path,
     output_dir: Path,
 ) -> dict[str, float]:
@@ -887,7 +1479,7 @@ def run_required_final_evaluations(
             records=ood_eval_records,
             device=accelerator.device,
             max_examples=args.eval_max_examples,
-            max_new_tokens=args.generation_max_new_tokens,
+            max_new_tokens=args.ood_generation_max_new_tokens or args.generation_max_new_tokens,
             add_bos_token=args.add_bos_token,
             humaneval_num_samples=args.humaneval_num_samples,
             humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
@@ -904,7 +1496,7 @@ def run_required_final_evaluations(
             records=reference_validation_records,
             device=accelerator.device,
             max_examples=args.eval_max_examples,
-            max_new_tokens=args.generation_max_new_tokens,
+            max_new_tokens=args.reference_generation_max_new_tokens or args.generation_max_new_tokens,
             add_bos_token=args.add_bos_token,
             humaneval_num_samples=args.humaneval_num_samples,
             humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
@@ -921,7 +1513,7 @@ def run_required_final_evaluations(
             records=reference_eval_records,
             device=accelerator.device,
             max_examples=args.eval_max_examples,
-            max_new_tokens=args.generation_max_new_tokens,
+            max_new_tokens=args.reference_generation_max_new_tokens or args.generation_max_new_tokens,
             add_bos_token=args.add_bos_token,
             humaneval_num_samples=args.humaneval_num_samples,
             humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
@@ -929,6 +1521,23 @@ def run_required_final_evaluations(
             humaneval_top_p=args.humaneval_top_p,
         )
         summary_updates.update(prefixed_metrics("reference_", reference_metrics))
+
+    if extra_eval_record_sets:
+        extra_metrics = evaluate_extra_record_sets(
+            model=unwrapped,
+            tokenizer=tokenizer,
+            device=accelerator.device,
+            record_sets=extra_eval_record_sets,
+            max_examples=args.eval_max_examples,
+            max_new_tokens=args.reference_generation_max_new_tokens or args.generation_max_new_tokens,
+            add_bos_token=args.add_bos_token,
+            prefix="extra_eval_",
+            humaneval_num_samples=args.humaneval_num_samples,
+            humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
+            humaneval_temperature=args.humaneval_temperature,
+            humaneval_top_p=args.humaneval_top_p,
+        )
+        summary_updates.update(extra_metrics)
 
     if args.bias_eval_data_path:
         del model
@@ -977,6 +1586,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-file", default=None)
     parser.add_argument("--reference-validation-file", default=None)
     parser.add_argument("--reference-test-file", default=None)
+    parser.add_argument("--reference-composition-name", default=None)
+    parser.add_argument("--reference-composition-domains", nargs="*", default=[])
     parser.add_argument("--reference-hf-stereoset", action="store_true")
     parser.add_argument("--reference-hf-subset", default="intrasentence")
     parser.add_argument("--reference-hf-split", default="validation")
@@ -1022,6 +1633,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-steps", type=int, default=20)
     parser.add_argument("--save-steps", type=int, default=0)
     parser.add_argument("--skip-final-evaluation", action="store_true")
+    parser.add_argument("--kl-regularization-lambda", type=float, default=0.0)
+    parser.add_argument("--kl-reference-max-examples", type=int, default=128)
+    parser.add_argument("--trajectory-eval-steps", type=int, default=0)
+    parser.add_argument("--trajectory-reference-max-examples", type=int, default=64)
+    parser.add_argument("--trajectory-target-max-examples", type=int, default=64)
+    parser.add_argument("--trajectory-generation-eval-steps", type=int, default=0)
+    parser.add_argument("--trajectory-generation-max-examples", type=int, default=16)
+    parser.add_argument("--trajectory-generation-max-new-tokens", type=int, default=32)
+    parser.add_argument("--trajectory-target-evaluator", default=None)
+    parser.add_argument("--trajectory-reference-evaluator", default="medical_reference")
+    parser.add_argument("--trajectory-instruction-file", default=None)
+    parser.add_argument("--trajectory-instruction-evaluator", default="ifeval_proxy")
+    parser.add_argument("--selection-method", default=None)
+    parser.add_argument("--selection-preconditioner", default=None)
+    parser.add_argument("--safe-rho", type=float, default=None)
+    parser.add_argument("--safe-epsilon", type=float, default=None)
+    parser.add_argument(
+        "--safe-training-constraint-mode",
+        choices=["none", "cumulative_line_search", "equal_allocation"],
+        default="none",
+        help=(
+            "Optional hard control for realized optimizer updates. cumulative_line_search "
+            "keeps every displacement from theta0 inside the global SAFE set; equal_allocation "
+            "uses per-step epsilon/T and rho/T^2 budgets."
+        ),
+    )
+    parser.add_argument(
+        "--safe-training-epsilon-scale-by-steps",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use safe_epsilon * T as the realized-training norm radius, where T is "
+            "the resolved optimizer-step horizon. The selector still uses safe_epsilon."
+        ),
+    )
+    parser.add_argument("--selected-predicted-fisher-cost", type=float, default=None)
+    parser.add_argument("--selected-predicted-norm-cost", type=float, default=None)
 
     parser.add_argument(
         "--evaluator",
@@ -1034,7 +1682,9 @@ def parse_args() -> argparse.Namespace:
             "esconv",
             "humaneval",
             "ifeval",
+            "ifeval_proxy",
             "medical_reference",
+            "mcq_ood",
             "bias_disentangle",
         ],
     )
@@ -1049,7 +1699,9 @@ def parse_args() -> argparse.Namespace:
             "esconv",
             "humaneval",
             "ifeval",
+            "ifeval_proxy",
             "medical_reference",
+            "mcq_ood",
             "bias_disentangle",
         ],
     )
@@ -1065,17 +1717,26 @@ def parse_args() -> argparse.Namespace:
             "esconv",
             "humaneval",
             "ifeval",
+            "ifeval_proxy",
             "medical_reference",
             "bias_disentangle",
         ],
     )
     parser.add_argument("--eval-max-examples", type=int, default=None)
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
+    parser.add_argument("--ood-generation-max-new-tokens", type=int, default=None)
+    parser.add_argument("--reference-generation-max-new-tokens", type=int, default=None)
     parser.add_argument("--humaneval-num-samples", type=int, default=1)
     parser.add_argument("--humaneval-pass-at-ks", nargs="+", type=int, default=[1])
     parser.add_argument("--humaneval-temperature", type=float, default=0.8)
     parser.add_argument("--humaneval-top-p", type=float, default=0.95)
     parser.add_argument("--benchmark-evals", nargs="+", choices=["mmlu", "gsm8k"], default=[])
+    parser.add_argument(
+        "--extra-evals",
+        nargs="*",
+        default=[],
+        help="Named held-out evals as NAME=EVALUATOR:/path/to/file.jsonl.",
+    )
     parser.add_argument("--evaluate-base-model", action="store_true")
     parser.add_argument("--evaluate-base-ood", action="store_true")
     parser.add_argument("--benchmark-max-examples", type=int, default=None)
@@ -1103,6 +1764,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.kl_regularization_lambda < 0:
+        raise ValueError("--kl-regularization-lambda must be non-negative.")
+    if args.trajectory_eval_steps < 0:
+        raise ValueError("--trajectory-eval-steps must be non-negative.")
+    if args.trajectory_generation_eval_steps < 0:
+        raise ValueError("--trajectory-generation-eval-steps must be non-negative.")
+    if args.safe_training_constraint_mode != "none":
+        if args.safe_rho is None and args.safe_epsilon is None:
+            raise ValueError(
+                "--safe-training-constraint-mode requires --safe-rho and/or --safe-epsilon."
+            )
+        if args.safe_rho is not None and not args.compute_reference_fisher:
+            raise ValueError(
+                "Fisher trajectory control requires --compute-reference-fisher."
+            )
+    if args.safe_training_epsilon_scale_by_steps:
+        if args.safe_training_constraint_mode == "none":
+            raise ValueError(
+                "--safe-training-epsilon-scale-by-steps requires a SAFE training "
+                "constraint mode."
+            )
+        if args.safe_epsilon is None:
+            raise ValueError(
+                "--safe-training-epsilon-scale-by-steps requires --safe-epsilon."
+            )
     output_dir = Path(args.output_dir)
     cache_dir = Path(args.cache_dir) if args.cache_dir is not None else output_dir / "cache"
     metrics_path = output_dir / "metrics.jsonl"
@@ -1121,6 +1807,14 @@ def main() -> None:
         save_json(config_path, vars(args))
 
     train_records = load_records(args.train_file)
+    safe_training_weights = [
+        float(record["safe_training_weight"])
+        for record in train_records
+        if "safe_training_weight" in record
+    ]
+    if safe_training_weights and len(safe_training_weights) != len(train_records):
+        raise ValueError("SAFE training files must provide safe_training_weight for every record or none.")
+    noop_training = bool(safe_training_weights) and max(safe_training_weights) == 0.0
     candidate_validation_records = load_records(args.candidate_validation_file) if args.candidate_validation_file else []
     candidate_test_records = load_records(args.candidate_test_file) if args.candidate_test_file else []
     validation_records = load_records(args.validation_file) if args.validation_file else []
@@ -1179,6 +1873,50 @@ def main() -> None:
             names=["reference", "bias_eval"],
             group_key=args.reference_split_group_key,
         )
+    kl_regularization_records = seeded_record_subset(
+        reference_records,
+        max_examples=args.kl_reference_max_examples,
+        seed=args.seed + 104729,
+    )
+    trajectory_reference_source = reference_eval_records or reference_validation_records
+    trajectory_reference_records = seeded_record_subset(
+        trajectory_reference_source,
+        max_examples=args.trajectory_reference_max_examples,
+        seed=args.seed + 130363,
+    )
+    trajectory_target_records = seeded_record_subset(
+        validation_records,
+        max_examples=args.trajectory_target_max_examples,
+        seed=args.seed + 155921,
+    )
+    trajectory_generation_target_records = seeded_record_subset(
+        validation_records,
+        max_examples=args.trajectory_generation_max_examples,
+        seed=args.seed + 179953,
+    )
+    trajectory_generation_reference_records = seeded_record_subset(
+        trajectory_reference_source,
+        max_examples=args.trajectory_generation_max_examples,
+        seed=args.seed + 196613,
+    )
+    trajectory_instruction_source = (
+        load_records(args.trajectory_instruction_file)
+        if args.trajectory_instruction_file
+        else []
+    )
+    trajectory_generation_instruction_records = seeded_record_subset(
+        trajectory_instruction_source,
+        max_examples=args.trajectory_generation_max_examples,
+        seed=args.seed + 214748,
+    )
+    if args.kl_regularization_lambda > 0 and not kl_regularization_records:
+        raise ValueError("KL regularization requires reference fitting records.")
+    if args.trajectory_eval_steps > 0 and not trajectory_reference_records:
+        raise ValueError("Trajectory diagnostics require held-out reference records.")
+    if args.trajectory_eval_steps > 0 and not trajectory_target_records:
+        raise ValueError("Trajectory diagnostics require target validation records.")
+    if args.trajectory_generation_eval_steps > 0 and not trajectory_generation_target_records:
+        raise ValueError("Trajectory generation diagnostics require target validation records.")
     validation_split_tag = None
     if args.validation_split_proportions and args.validation_split_role:
         validation_split_tag = (
@@ -1198,6 +1936,7 @@ def main() -> None:
         )
 
     benchmark_records = load_named_benchmark_records(args) if args.benchmark_evals else {}
+    extra_eval_record_sets = load_extra_eval_record_sets(args)
 
     base_model, tokenizer = build_base_model_and_tokenizer(args)
     if args.evaluate_base_model:
@@ -1246,7 +1985,7 @@ def main() -> None:
                 records=ood_eval_records,
                 device=accelerator.device,
                 max_examples=args.eval_max_examples,
-                max_new_tokens=args.generation_max_new_tokens,
+                max_new_tokens=args.ood_generation_max_new_tokens or args.generation_max_new_tokens,
                 add_bos_token=args.add_bos_token,
                 humaneval_num_samples=args.humaneval_num_samples,
                 humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
@@ -1264,7 +2003,7 @@ def main() -> None:
                 records=reference_eval_records,
                 device=accelerator.device,
                 max_examples=args.eval_max_examples,
-                max_new_tokens=args.generation_max_new_tokens,
+                max_new_tokens=args.reference_generation_max_new_tokens or args.generation_max_new_tokens,
                 add_bos_token=args.add_bos_token,
                 humaneval_num_samples=args.humaneval_num_samples,
                 humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
@@ -1282,7 +2021,7 @@ def main() -> None:
                 records=reference_validation_records,
                 device=accelerator.device,
                 max_examples=args.eval_max_examples,
-                max_new_tokens=args.generation_max_new_tokens,
+                max_new_tokens=args.reference_generation_max_new_tokens or args.generation_max_new_tokens,
                 add_bos_token=args.add_bos_token,
                 humaneval_num_samples=args.humaneval_num_samples,
                 humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
@@ -1298,6 +2037,23 @@ def main() -> None:
                 metrics_path,
                 {"type": "reference_validation_base_evaluation", **prefixed_reference_validation_base},
             )
+        if extra_eval_record_sets:
+            extra_base_metrics = evaluate_extra_record_sets(
+                model=base_model,
+                tokenizer=tokenizer,
+                device=accelerator.device,
+                record_sets=extra_eval_record_sets,
+                max_examples=args.eval_max_examples,
+                max_new_tokens=args.reference_generation_max_new_tokens or args.generation_max_new_tokens,
+                add_bos_token=args.add_bos_token,
+                prefix="base_extra_eval_",
+                humaneval_num_samples=args.humaneval_num_samples,
+                humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
+                humaneval_temperature=args.humaneval_temperature,
+                humaneval_top_p=args.humaneval_top_p,
+            )
+            base_eval_metrics.update(extra_base_metrics)
+            append_jsonl(metrics_path, {"type": "extra_eval_base", **extra_base_metrics})
     accelerator.wait_for_everyone()
     model = attach_lora_adapter(base_model, args)
     # Validation-gradient and reference-Fisher probes run before `accelerator.prepare`,
@@ -1397,6 +2153,62 @@ def main() -> None:
             cache_dir=cache_dir,
             overwrite_cache=args.overwrite_cache,
             dataset_cache_tag=(reference_split_tag or "reference_eval") + "_loss",
+        )
+    tokenized_extra_eval: dict[str, list[dict[str, torch.Tensor]]] = {}
+    for item in extra_eval_record_sets:
+        records = item.get("records") or []
+        if not records:
+            continue
+        tokenized = prepare_tokenized_dataset(
+            accelerator=accelerator,
+            records=records,
+            dataset_path=item["file"],
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            add_bos_token=args.add_bos_token,
+            cache_dir=cache_dir,
+            overwrite_cache=args.overwrite_cache,
+            dataset_cache_tag=f"extra_eval_{item['name']}_kl",
+        )
+        if tokenized:
+            tokenized_extra_eval[str(item["name"])] = tokenized
+    tokenized_kl_reference = []
+    if args.kl_regularization_lambda > 0:
+        tokenized_kl_reference = prepare_tokenized_dataset(
+            accelerator=accelerator,
+            records=kl_regularization_records,
+            dataset_path=args.reference_file,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            add_bos_token=args.add_bos_token,
+            cache_dir=cache_dir,
+            overwrite_cache=args.overwrite_cache,
+            dataset_cache_tag=f"kl_reference_seed{args.seed}_n{len(kl_regularization_records)}",
+        )
+    tokenized_trajectory_reference = []
+    tokenized_trajectory_target = []
+    if args.trajectory_eval_steps > 0:
+        tokenized_trajectory_reference = prepare_tokenized_dataset(
+            accelerator=accelerator,
+            records=trajectory_reference_records,
+            dataset_path=args.reference_test_file or args.reference_validation_file or args.reference_file,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            add_bos_token=args.add_bos_token,
+            cache_dir=cache_dir,
+            overwrite_cache=args.overwrite_cache,
+            dataset_cache_tag=f"trajectory_reference_seed{args.seed}_n{len(trajectory_reference_records)}",
+        )
+        tokenized_trajectory_target = prepare_tokenized_dataset(
+            accelerator=accelerator,
+            records=trajectory_target_records,
+            dataset_path=args.validation_file or args.train_file,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            add_bos_token=args.add_bos_token,
+            cache_dir=cache_dir,
+            overwrite_cache=args.overwrite_cache,
+            dataset_cache_tag=f"trajectory_target_seed{args.seed}_n{len(trajectory_target_records)}",
         )
 
     validation_gradient_result = None
@@ -1516,6 +2328,38 @@ def main() -> None:
             collate_fn=collator,
             batch_size=args.per_device_eval_batch_size,
         )
+    extra_eval_dataloaders: dict[str, Any] = {}
+    for name, tokenized in tokenized_extra_eval.items():
+        extra_eval_dataloaders[name] = DataLoader(
+            tokenized,
+            shuffle=False,
+            collate_fn=collator,
+            batch_size=args.per_device_eval_batch_size,
+        )
+    kl_reference_dataloader = None
+    if tokenized_kl_reference:
+        kl_reference_dataloader = DataLoader(
+            tokenized_kl_reference,
+            shuffle=True,
+            collate_fn=collator,
+            batch_size=args.per_device_train_batch_size,
+        )
+    trajectory_reference_dataloader = None
+    if tokenized_trajectory_reference:
+        trajectory_reference_dataloader = DataLoader(
+            tokenized_trajectory_reference,
+            shuffle=False,
+            collate_fn=collator,
+            batch_size=args.per_device_eval_batch_size,
+        )
+    trajectory_target_dataloader = None
+    if tokenized_trajectory_target:
+        trajectory_target_dataloader = DataLoader(
+            tokenized_trajectory_target,
+            shuffle=False,
+            collate_fn=collator,
+            batch_size=args.per_device_eval_batch_size,
+        )
 
     optimizer = torch.optim.AdamW(
         [param for _, param in get_trainable_named_parameters(model)],
@@ -1524,17 +2368,25 @@ def main() -> None:
     )
 
     num_update_steps_per_epoch = max(1, math.ceil(len(train_dataloader) / args.gradient_accumulation_steps))
-    if args.max_steps is None:
+    if noop_training:
+        max_steps = 0
+    elif args.max_steps is None:
         max_steps = max(1, math.ceil(args.num_train_epochs * num_update_steps_per_epoch))
     else:
         max_steps = int(args.max_steps)
     num_warmup_steps = int(math.ceil(max_steps * float(args.warmup_ratio)))
+    safe_training_epsilon = args.safe_epsilon
+    if (
+        safe_training_epsilon is not None
+        and args.safe_training_epsilon_scale_by_steps
+    ):
+        safe_training_epsilon = float(safe_training_epsilon) * float(max_steps)
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=num_warmup_steps,
-        num_training_steps=max_steps,
+        num_training_steps=max(1, max_steps),
     )
 
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -1555,6 +2407,14 @@ def main() -> None:
         reference_validation_dataloader = accelerator.prepare(reference_validation_dataloader)
     if reference_eval_dataloader is not None:
         reference_eval_dataloader = accelerator.prepare(reference_eval_dataloader)
+    for name, dataloader in list(extra_eval_dataloaders.items()):
+        extra_eval_dataloaders[name] = accelerator.prepare(dataloader)
+    if kl_reference_dataloader is not None:
+        kl_reference_dataloader = accelerator.prepare(kl_reference_dataloader)
+    if trajectory_reference_dataloader is not None:
+        trajectory_reference_dataloader = accelerator.prepare(trajectory_reference_dataloader)
+    if trajectory_target_dataloader is not None:
+        trajectory_target_dataloader = accelerator.prepare(trajectory_target_dataloader)
 
     theta0 = flatten_trainable_parameters(accelerator.unwrap_model(model))
     previous_theta = theta0.clone()
@@ -1565,6 +2425,17 @@ def main() -> None:
     summary: dict[str, Any] = {
         "train_examples": len(train_records),
         "effective_train_examples": len(tokenized_train),
+        "weighted_training": bool(safe_training_weights),
+        "noop_training": noop_training,
+        "safe_training_weight_sum": (
+            float(sum(safe_training_weights)) if safe_training_weights else None
+        ),
+        "safe_training_weight_min": (
+            float(min(safe_training_weights)) if safe_training_weights else None
+        ),
+        "safe_training_weight_max": (
+            float(max(safe_training_weights)) if safe_training_weights else None
+        ),
         "candidate_validation_examples": len(candidate_validation_records),
         "candidate_test_examples": len(candidate_test_records),
         "effective_candidate_validation_examples": len(tokenized_candidate_validation),
@@ -1574,12 +2445,52 @@ def main() -> None:
         "ood_evaluation_examples": len(ood_eval_records),
         "effective_validation_examples": len(tokenized_validation),
         "reference_examples": len(reference_records),
+        "reference_composition_name": args.reference_composition_name,
+        "reference_composition_domains": list(args.reference_composition_domains or []),
         "reference_validation_examples": len(reference_validation_records),
         "reference_eval_examples": len(reference_eval_records),
         "reference_test_examples": len(reference_eval_records),
+        "extra_eval_examples": {
+            str(item["name"]): len(item.get("records") or [])
+            for item in extra_eval_record_sets
+        },
+        "effective_extra_eval_examples": {
+            name: len(tokenized)
+            for name, tokenized in tokenized_extra_eval.items()
+        },
+        "extra_evals": [
+            {key: value for key, value in item.items() if key != "records"}
+            for item in extra_eval_record_sets
+        ],
         "effective_reference_validation_examples": len(tokenized_reference_validation),
         "effective_reference_eval_examples": len(tokenized_reference_eval),
         "effective_reference_test_examples": len(tokenized_reference_eval),
+        "kl_regularization_lambda": float(args.kl_regularization_lambda),
+        "kl_reference_examples": len(kl_regularization_records),
+        "trajectory_eval_steps": int(args.trajectory_eval_steps),
+        "trajectory_reference_examples": len(trajectory_reference_records),
+        "trajectory_target_examples": len(trajectory_target_records),
+        "trajectory_generation_eval_steps": int(args.trajectory_generation_eval_steps),
+        "trajectory_generation_target_examples": len(trajectory_generation_target_records),
+        "trajectory_generation_reference_examples": len(trajectory_generation_reference_records),
+        "trajectory_generation_instruction_examples": len(trajectory_generation_instruction_records),
+        "trajectory_target_evaluator": args.trajectory_target_evaluator or args.evaluator,
+        "trajectory_reference_evaluator": args.trajectory_reference_evaluator,
+        "trajectory_instruction_evaluator": args.trajectory_instruction_evaluator,
+        "selection_method": args.selection_method,
+        "selection_preconditioner": args.selection_preconditioner,
+        "safe_rho": args.safe_rho,
+        "safe_epsilon": args.safe_epsilon,
+        "safe_training_epsilon": safe_training_epsilon,
+        "safe_training_epsilon_scale_by_steps": bool(
+            args.safe_training_epsilon_scale_by_steps
+        ),
+        "safe_training_epsilon_scale_horizon": (
+            max_steps if args.safe_training_epsilon_scale_by_steps else None
+        ),
+        "safe_training_constraint_mode": args.safe_training_constraint_mode,
+        "selected_predicted_fisher_cost": args.selected_predicted_fisher_cost,
+        "selected_predicted_norm_cost": args.selected_predicted_norm_cost,
         "seed": args.seed,
         "num_warmup_steps": num_warmup_steps,
         "max_steps": max_steps,
@@ -1600,6 +2511,187 @@ def main() -> None:
         }
     summary.update(base_eval_metrics)
 
+    if args.trajectory_eval_steps > 0 and reference_fisher_result is None:
+        raise ValueError("Trajectory diagnostics require --compute-reference-fisher.")
+
+    estimated_sft_flops = 0.0
+    estimated_kl_regularization_flops = 0.0
+    estimated_trajectory_diagnostic_flops = 0.0
+    estimated_trajectory_generation_flops = 0.0
+    trajectory_points: list[dict[str, Any]] = []
+    initial_trajectory_target_loss: float | None = None
+    initial_trajectory_generation_metrics: dict[str, float] = {}
+    kl_reference_iterator = iter(kl_reference_dataloader) if kl_reference_dataloader is not None else None
+
+    def collect_trajectory_point(step: int, epoch: int) -> None:
+        nonlocal estimated_trajectory_diagnostic_flops
+        nonlocal estimated_trajectory_generation_flops
+        nonlocal initial_trajectory_target_loss
+        if trajectory_reference_dataloader is None or trajectory_target_dataloader is None:
+            return
+        current_theta = flatten_trainable_parameters(accelerator.unwrap_model(model))
+        cumulative_delta = current_theta - theta0
+        fisher = reference_fisher_result.tensor.float()
+        predicted_fisher_cost = float(
+            (0.5 * torch.dot(cumulative_delta.float(), fisher * cumulative_delta.float())).item()
+        )
+        cumulative_norm_cost = float(0.5 * torch.dot(cumulative_delta.float(), cumulative_delta.float()).item())
+        target_loss, target_flops = evaluate_validation_loss_with_flops(
+            model,
+            trajectory_target_dataloader,
+            accelerator,
+        )
+        realized_kl, reference_flops = evaluate_realized_heldout_kl(
+            model,
+            trajectory_reference_dataloader,
+            accelerator,
+        )
+        estimated_trajectory_diagnostic_flops += target_flops + reference_flops
+        if initial_trajectory_target_loss is None:
+            initial_trajectory_target_loss = float(target_loss)
+        degradation = float(target_loss) - float(initial_trajectory_target_loss)
+        point = {
+            "type": "trajectory_diagnostics",
+            "step": int(step),
+            "epoch": int(epoch),
+            "predicted_fisher_cost": predicted_fisher_cost,
+            "trained_lora_fisher_cost": predicted_fisher_cost,
+            "cumulative_reference_cost": predicted_fisher_cost,
+            "cumulative_norm_cost": cumulative_norm_cost,
+            "realized_heldout_kl": float(realized_kl),
+            "target_validation_loss": float(target_loss),
+            "target_loss_degradation": degradation,
+            "target_performance_proxy": -float(target_loss),
+            "target_performance_delta": -degradation,
+            "cumulative_delta_theta_norm": float(cumulative_delta.norm().item()),
+            "safe_rho": args.safe_rho,
+            "safe_epsilon": args.safe_epsilon,
+            "safe_training_epsilon": safe_training_epsilon,
+            "selection_method": args.selection_method,
+            "selection_preconditioner": args.selection_preconditioner,
+            "selected_predicted_fisher_cost": args.selected_predicted_fisher_cost,
+            "selected_predicted_norm_cost": args.selected_predicted_norm_cost,
+            **constraint_audit(
+                cost=predicted_fisher_cost,
+                budget=args.safe_rho,
+                prefix="cumulative_reference",
+            ),
+            **constraint_audit(
+                cost=cumulative_norm_cost,
+                budget=(
+                    None
+                    if safe_training_epsilon is None
+                    else 0.5 * float(safe_training_epsilon) ** 2
+                ),
+                prefix="cumulative_norm",
+            ),
+            "estimated_sft_flops": estimated_sft_flops,
+            "estimated_kl_regularization_flops": estimated_kl_regularization_flops,
+            "estimated_trajectory_diagnostic_flops": estimated_trajectory_diagnostic_flops,
+            "estimated_trajectory_generation_flops": estimated_trajectory_generation_flops,
+            "estimated_total_flops": (
+                estimated_sft_flops
+                + estimated_kl_regularization_flops
+                + estimated_trajectory_diagnostic_flops
+                + estimated_trajectory_generation_flops
+            ),
+        }
+        should_run_generation = (
+            args.trajectory_generation_eval_steps > 0
+            and (
+                step == 0
+                or step % args.trajectory_generation_eval_steps == 0
+                or step == max_steps
+            )
+        )
+        if should_run_generation and accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(model)
+            was_training = bool(unwrapped.training)
+            generation_groups = [
+                (
+                    "target",
+                    args.trajectory_target_evaluator or args.evaluator,
+                    trajectory_generation_target_records,
+                ),
+                (
+                    "reference",
+                    args.trajectory_reference_evaluator,
+                    trajectory_generation_reference_records,
+                ),
+                (
+                    "instruction",
+                    args.trajectory_instruction_evaluator,
+                    trajectory_generation_instruction_records,
+                ),
+            ]
+            for group_name, evaluator_name, records in generation_groups:
+                if not records or evaluator_name in {None, "none", "loss", "bias_disentangle"}:
+                    continue
+                group_metrics = evaluate_records_with_config(
+                    evaluator_name=evaluator_name,
+                    model=unwrapped,
+                    tokenizer=tokenizer,
+                    records=records,
+                    device=accelerator.device,
+                    max_examples=args.trajectory_generation_max_examples,
+                    max_new_tokens=args.trajectory_generation_max_new_tokens,
+                    add_bos_token=args.add_bos_token,
+                    humaneval_num_samples=args.humaneval_num_samples,
+                    humaneval_pass_at_ks=tuple(args.humaneval_pass_at_ks),
+                    humaneval_temperature=args.humaneval_temperature,
+                    humaneval_top_p=args.humaneval_top_p,
+                )
+                parameter_count = sum(
+                    parameter.numel() for parameter in unwrapped.parameters()
+                )
+                estimated_trajectory_generation_flops += (
+                    2.0
+                    * float(parameter_count)
+                    * float(args.max_seq_length + args.trajectory_generation_max_new_tokens)
+                    * float(min(len(records), args.trajectory_generation_max_examples))
+                )
+                for metric_name, metric_value in group_metrics.items():
+                    key = f"{group_name}_{metric_name}"
+                    value = float(metric_value)
+                    point[key] = value
+                    initial_trajectory_generation_metrics.setdefault(key, value)
+                    if not metric_name.endswith(("_count", "_instruction_count")):
+                        point[f"{key}_delta"] = value - initial_trajectory_generation_metrics[key]
+            if "target_medqa_accuracy" in point:
+                point["target_performance"] = point["target_medqa_accuracy"]
+                point["target_performance_delta_actual"] = point["target_medqa_accuracy_delta"]
+            if "reference_medical_reference_primary_score" in point:
+                point["reference_performance_degradation"] = -point[
+                    "reference_medical_reference_primary_score_delta"
+                ]
+            if "instruction_ifeval_proxy_instruction_accuracy" in point:
+                point["instruction_performance_degradation"] = -point[
+                    "instruction_ifeval_proxy_instruction_accuracy_delta"
+                ]
+            if was_training:
+                unwrapped.train()
+            point["estimated_trajectory_generation_flops"] = estimated_trajectory_generation_flops
+            point["estimated_total_flops"] = (
+                estimated_sft_flops
+                + estimated_kl_regularization_flops
+                + estimated_trajectory_diagnostic_flops
+                + estimated_trajectory_generation_flops
+            )
+        trajectory_points.append(point)
+        if accelerator.is_main_process:
+            append_jsonl(metrics_path, point)
+
+    if args.trajectory_eval_steps > 0:
+        collect_trajectory_point(step=0, epoch=0)
+    train_start_time = time.perf_counter()
+    sum_incremental_reference_cost = 0.0
+    sum_incremental_norm_cost = 0.0
+    all_incremental_reference_constraints_satisfied = True
+    all_incremental_norm_constraints_satisfied = True
+    trajectory_projection_steps = 0
+    trajectory_projection_active_steps = 0
+    trajectory_projection_scale_sum = 0.0
+    trajectory_projection_min_scale = 1.0
     model.train()
     for epoch in range(math.ceil(args.num_train_epochs) if args.max_steps is None else 10**9):
         if completed_steps >= max_steps:
@@ -1609,9 +2701,35 @@ def main() -> None:
             if completed_steps >= max_steps:
                 break
 
+            unwrapped_for_flops = accelerator.unwrap_model(model)
+            estimated_sft_flops += estimate_batch_training_flops(unwrapped_for_flops, batch)
             with accelerator.accumulate(model):
+                example_weights = batch.pop("example_weights", None)
                 outputs = model(**batch)
-                loss = outputs.loss
+                sft_loss = (
+                    outputs.loss
+                    if example_weights is None
+                    else weighted_causal_lm_loss(outputs.logits, batch["labels"], example_weights)
+                )
+                kl_regularization_loss = None
+                if kl_reference_iterator is not None:
+                    try:
+                        kl_batch = next(kl_reference_iterator)
+                    except StopIteration:
+                        kl_reference_iterator = iter(kl_reference_dataloader)
+                        kl_batch = next(kl_reference_iterator)
+                    kl_regularization_loss = compute_reference_kl_regularization_loss(
+                        model,
+                        kl_batch,
+                        accelerator,
+                    )
+                    estimated_kl_regularization_flops += (
+                        (4.0 / 3.0)
+                        * estimate_batch_training_flops(unwrapped_for_flops, kl_batch)
+                    )
+                loss = sft_loss
+                if kl_regularization_loss is not None:
+                    loss = loss + float(args.kl_regularization_lambda) * kl_regularization_loss
                 accelerator.backward(loss)
 
                 grad_vector = None
@@ -1622,6 +2740,141 @@ def main() -> None:
                         accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                 optimizer.step()
+                projected_current_theta: torch.Tensor | None = None
+                projection_metrics: dict[str, Any] = {}
+                if (
+                    accelerator.sync_gradients
+                    and args.safe_training_constraint_mode != "none"
+                ):
+                    unwrapped = accelerator.unwrap_model(model)
+                    proposed_theta = flatten_trainable_parameters(unwrapped)
+                    proposal = proposed_theta - previous_theta
+                    displacement_before_update = previous_theta - theta0
+                    projection_fisher = (
+                        None
+                        if reference_fisher_result is None
+                        else reference_fisher_result.tensor.float()
+                    )
+                    projection_scale, projection_metrics = safe_training_update_scale(
+                        mode=args.safe_training_constraint_mode,
+                        displacement=displacement_before_update,
+                        proposal=proposal,
+                        fisher=projection_fisher,
+                        rho=args.safe_rho,
+                        epsilon=safe_training_epsilon,
+                        max_steps=max_steps,
+                    )
+                    accepted_theta = previous_theta + projection_scale * proposal
+                    if projection_scale < 1.0:
+                        assign_trainable_parameters_from_flat(unwrapped, accepted_theta)
+
+                    projected_current_theta = flatten_trainable_parameters(unwrapped)
+                    accepted_displacement = projected_current_theta - theta0
+                    realized_projection_error = proposed_theta - projected_current_theta
+                    accepted_norm_cost = float(
+                        0.5
+                        * torch.dot(
+                            accepted_displacement.float(),
+                            accepted_displacement.float(),
+                        ).item()
+                    )
+                    projection_metrics.update(
+                        {
+                            "trajectory_projection_l2_error": float(
+                                realized_projection_error.norm().item()
+                            ),
+                            "accepted_cumulative_norm_cost": accepted_norm_cost,
+                        }
+                    )
+                    accepted_norm_audit = constraint_audit(
+                        cost=accepted_norm_cost,
+                        budget=(
+                            None
+                            if safe_training_epsilon is None
+                            else 0.5 * float(safe_training_epsilon) ** 2
+                        ),
+                        prefix="accepted_cumulative_norm",
+                    )
+                    projection_metrics.update(accepted_norm_audit)
+                    proposed_norm_cost = projection_metrics.get(
+                        "proposed_cumulative_norm_cost"
+                    )
+                    if proposed_norm_cost is not None:
+                        projection_metrics.update(
+                            constraint_audit(
+                                cost=float(proposed_norm_cost),
+                                budget=(
+                                    None
+                                    if safe_training_epsilon is None
+                                    else 0.5 * float(safe_training_epsilon) ** 2
+                                ),
+                                prefix="proposed_cumulative_norm",
+                            )
+                        )
+
+                    accepted_reference_audit: dict[str, Any] = {}
+                    if projection_fisher is not None:
+                        accepted_reference_cost = float(
+                            0.5
+                            * torch.dot(
+                                accepted_displacement.float(),
+                                projection_fisher * accepted_displacement.float(),
+                            ).item()
+                        )
+                        projection_metrics.update(
+                            {
+                                "accepted_cumulative_reference_cost": accepted_reference_cost,
+                                "trajectory_projection_fisher_error": float(
+                                    0.5
+                                    * torch.dot(
+                                        realized_projection_error.float(),
+                                        projection_fisher
+                                        * realized_projection_error.float(),
+                                    ).item()
+                                ),
+                            }
+                        )
+                        accepted_reference_audit = constraint_audit(
+                            cost=accepted_reference_cost,
+                            budget=args.safe_rho,
+                            prefix="accepted_cumulative_reference",
+                        )
+                        projection_metrics.update(accepted_reference_audit)
+                        proposed_reference_cost = projection_metrics.get(
+                            "proposed_cumulative_reference_cost"
+                        )
+                        if proposed_reference_cost is not None:
+                            projection_metrics.update(
+                                constraint_audit(
+                                    cost=float(proposed_reference_cost),
+                                    budget=args.safe_rho,
+                                    prefix="proposed_cumulative_reference",
+                                )
+                            )
+
+                    if (
+                        accepted_norm_audit[
+                            "accepted_cumulative_norm_budget_satisfied"
+                        ]
+                        is False
+                        or accepted_reference_audit.get(
+                            "accepted_cumulative_reference_budget_satisfied"
+                        )
+                        is False
+                    ):
+                        raise RuntimeError(
+                            "Projected optimizer update did not satisfy the requested "
+                            "cumulative SAFE constraints."
+                        )
+
+                    trajectory_projection_steps += 1
+                    trajectory_projection_scale_sum += projection_scale
+                    trajectory_projection_min_scale = min(
+                        trajectory_projection_min_scale,
+                        projection_scale,
+                    )
+                    if projection_scale < 1.0 - 1.0e-8:
+                        trajectory_projection_active_steps += 1
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
@@ -1631,7 +2884,11 @@ def main() -> None:
                 accelerator.wait_for_everyone()
                 completed_steps += 1
                 unwrapped = accelerator.unwrap_model(model)
-                current_theta = flatten_trainable_parameters(unwrapped)
+                current_theta = (
+                    projected_current_theta
+                    if projected_current_theta is not None
+                    else flatten_trainable_parameters(unwrapped)
+                )
                 delta_theta = current_theta - previous_theta
                 cumulative_delta = current_theta - theta0
                 previous_theta = current_theta
@@ -1640,21 +2897,131 @@ def main() -> None:
                     "step": completed_steps,
                     "epoch": epoch,
                     "train_loss": float(accelerator.gather_for_metrics(loss.detach().unsqueeze(0)).mean().item()),
+                    "sft_loss": float(
+                        accelerator.gather_for_metrics(sft_loss.detach().unsqueeze(0)).mean().item()
+                    ),
+                    "kl_regularization_loss": (
+                        None
+                        if kl_regularization_loss is None
+                        else float(
+                            accelerator.gather_for_metrics(
+                                kl_regularization_loss.detach().unsqueeze(0)
+                            ).mean().item()
+                        )
+                    ),
+                    "kl_regularization_lambda": float(args.kl_regularization_lambda),
+                    "safe_training_constraint_mode": args.safe_training_constraint_mode,
                     "learning_rate": float(lr_scheduler.get_last_lr()[0]),
                     "grad_norm": float(grad_vector.norm().item()) if grad_vector is not None else None,
                     "delta_theta_norm": float(delta_theta.norm().item()),
                     "cumulative_delta_theta_norm": float(cumulative_delta.norm().item()),
                     "step_wallclock_seconds": time.perf_counter() - train_start_time,
+                    "estimated_sft_flops": estimated_sft_flops,
+                    "estimated_kl_regularization_flops": estimated_kl_regularization_flops,
+                    "estimated_trajectory_diagnostic_flops": estimated_trajectory_diagnostic_flops,
+                    "estimated_trajectory_generation_flops": estimated_trajectory_generation_flops,
+                    "estimated_total_flops": (
+                        estimated_sft_flops
+                        + estimated_kl_regularization_flops
+                        + estimated_trajectory_diagnostic_flops
+                        + estimated_trajectory_generation_flops
+                    ),
                 }
+                metrics.update(projection_metrics)
+                incremental_norm_cost = float(0.5 * torch.dot(delta_theta.float(), delta_theta.float()).item())
+                cumulative_norm_cost = float(
+                    0.5 * torch.dot(cumulative_delta.float(), cumulative_delta.float()).item()
+                )
+                sum_incremental_norm_cost += incremental_norm_cost
+                norm_budget = (
+                    None
+                    if safe_training_epsilon is None
+                    else 0.5 * float(safe_training_epsilon) ** 2
+                )
+                incremental_norm_audit = constraint_audit(
+                    cost=incremental_norm_cost,
+                    budget=norm_budget,
+                    prefix="incremental_norm",
+                )
+                cumulative_norm_audit = constraint_audit(
+                    cost=cumulative_norm_cost,
+                    budget=norm_budget,
+                    prefix="cumulative_norm",
+                )
+                if incremental_norm_audit["incremental_norm_budget_satisfied"] is False:
+                    all_incremental_norm_constraints_satisfied = False
+                metrics.update(
+                    {
+                        "incremental_norm_cost": incremental_norm_cost,
+                        "cumulative_norm_cost": cumulative_norm_cost,
+                        "sum_incremental_norm_cost": sum_incremental_norm_cost,
+                        "norm_cost_cross_term_total": cumulative_norm_cost - sum_incremental_norm_cost,
+                        "all_incremental_norm_constraints_satisfied_so_far": (
+                            all_incremental_norm_constraints_satisfied
+                        ),
+                        **incremental_norm_audit,
+                        **cumulative_norm_audit,
+                    }
+                )
+                if args.selected_predicted_norm_cost is not None:
+                    selected_norm_cost = float(args.selected_predicted_norm_cost)
+                    metrics["incremental_selected_norm_cost_calibration_abs_error"] = abs(
+                        incremental_norm_cost - selected_norm_cost
+                    )
+                    metrics["cumulative_selected_norm_cost_calibration_abs_error"] = abs(
+                        cumulative_norm_cost - selected_norm_cost
+                    )
 
                 if reference_fisher_result is not None:
                     fisher = reference_fisher_result.tensor.float()
-                    metrics["delta_theta_reference_cost"] = float(
+                    incremental_reference_cost = float(
                         (0.5 * torch.dot(delta_theta.float(), fisher * delta_theta.float())).item()
                     )
-                    metrics["cumulative_reference_cost"] = float(
+                    cumulative_reference_cost = float(
                         (0.5 * torch.dot(cumulative_delta.float(), fisher * cumulative_delta.float())).item()
                     )
+                    previous_cumulative_delta = cumulative_delta.float() - delta_theta.float()
+                    reference_cross_term = float(
+                        torch.dot(previous_cumulative_delta, fisher * delta_theta.float()).item()
+                    )
+                    sum_incremental_reference_cost += incremental_reference_cost
+                    incremental_reference_audit = constraint_audit(
+                        cost=incremental_reference_cost,
+                        budget=args.safe_rho,
+                        prefix="incremental_reference",
+                    )
+                    cumulative_reference_audit = constraint_audit(
+                        cost=cumulative_reference_cost,
+                        budget=args.safe_rho,
+                        prefix="cumulative_reference",
+                    )
+                    if incremental_reference_audit["incremental_reference_budget_satisfied"] is False:
+                        all_incremental_reference_constraints_satisfied = False
+                    metrics.update(
+                        {
+                            "delta_theta_reference_cost": incremental_reference_cost,
+                            "incremental_reference_cost": incremental_reference_cost,
+                            "cumulative_reference_cost": cumulative_reference_cost,
+                            "reference_cost_cross_term": reference_cross_term,
+                            "sum_incremental_reference_cost": sum_incremental_reference_cost,
+                            "reference_cost_cross_term_total": (
+                                cumulative_reference_cost - sum_incremental_reference_cost
+                            ),
+                            "all_incremental_reference_constraints_satisfied_so_far": (
+                                all_incremental_reference_constraints_satisfied
+                            ),
+                            **incremental_reference_audit,
+                            **cumulative_reference_audit,
+                        }
+                    )
+                    if args.selected_predicted_fisher_cost is not None:
+                        selected_fisher_cost = float(args.selected_predicted_fisher_cost)
+                        metrics["incremental_selected_fisher_cost_calibration_abs_error"] = abs(
+                            incremental_reference_cost - selected_fisher_cost
+                        )
+                        metrics["cumulative_selected_fisher_cost_calibration_abs_error"] = abs(
+                            cumulative_reference_cost - selected_fisher_cost
+                        )
                 if validation_gradient_result is not None:
                     validation_grad = validation_gradient_result.tensor.float()
                     step_dot = torch.dot(validation_grad, delta_theta.float())
@@ -1669,6 +3036,18 @@ def main() -> None:
 
                 if accelerator.is_main_process:
                     append_jsonl(metrics_path, metrics)
+
+                should_log_trajectory = (
+                    args.trajectory_eval_steps > 0
+                    and (
+                        completed_steps % args.trajectory_eval_steps == 0
+                        or completed_steps == max_steps
+                    )
+                )
+                if should_log_trajectory:
+                    accelerator.wait_for_everyone()
+                    collect_trajectory_point(step=completed_steps, epoch=epoch)
+                    accelerator.wait_for_everyone()
 
                 should_log_eval = (
                     validation_dataloader is not None
@@ -1739,6 +3118,13 @@ def main() -> None:
     reference_eval_loss = None
     if reference_eval_dataloader is not None:
         reference_eval_loss = evaluate_validation_loss(model, reference_eval_dataloader, accelerator)
+    extra_eval_kl_metrics: dict[str, float] = {}
+    estimated_extra_eval_kl_flops = 0.0
+    for name, dataloader in extra_eval_dataloaders.items():
+        realized_kl, kl_flops = evaluate_realized_heldout_kl(model, dataloader, accelerator)
+        extra_eval_kl_metrics[f"extra_eval_{name}_heldout_kl"] = float(realized_kl)
+        extra_eval_kl_metrics[f"extra_eval_{name}_heldout_kl_forward_flops"] = float(kl_flops)
+        estimated_extra_eval_kl_flops += float(kl_flops)
     if accelerator.is_main_process:
         final_dir = output_dir / "final_adapter"
         accelerator.unwrap_model(model).save_pretrained(final_dir)
@@ -1751,6 +3137,50 @@ def main() -> None:
                 "output_dir": str(output_dir),
                 "final_adapter_dir": str(final_dir),
                 "completed_steps": completed_steps,
+                "estimated_sft_flops": estimated_sft_flops,
+                "estimated_kl_regularization_flops": estimated_kl_regularization_flops,
+                "estimated_trajectory_diagnostic_flops": estimated_trajectory_diagnostic_flops,
+                "estimated_trajectory_generation_flops": estimated_trajectory_generation_flops,
+                "estimated_extra_eval_kl_flops": estimated_extra_eval_kl_flops,
+                "estimated_total_flops": (
+                    estimated_sft_flops
+                    + estimated_kl_regularization_flops
+                    + estimated_trajectory_diagnostic_flops
+                    + estimated_trajectory_generation_flops
+                    + estimated_extra_eval_kl_flops
+                ),
+                "flops_estimation_method": (
+                    "transformers_floating_point_ops_with_6x_token_parameter_fallback;"
+                    "generation_uses_2x_parameter_token_upper_bound"
+                ),
+                "trajectory_correlations": (
+                    trajectory_correlation_summary(trajectory_points)
+                    if trajectory_points
+                    else None
+                ),
+                "trajectory_points": trajectory_points,
+                "all_incremental_reference_constraints_satisfied": (
+                    all_incremental_reference_constraints_satisfied
+                ),
+                "all_incremental_norm_constraints_satisfied": (
+                    all_incremental_norm_constraints_satisfied
+                ),
+                "sum_incremental_reference_cost": sum_incremental_reference_cost,
+                "sum_incremental_norm_cost": sum_incremental_norm_cost,
+                "trajectory_projection_steps": trajectory_projection_steps,
+                "trajectory_projection_active_steps": trajectory_projection_active_steps,
+                "trajectory_projection_active_fraction": (
+                    float(trajectory_projection_active_steps)
+                    / float(trajectory_projection_steps)
+                    if trajectory_projection_steps
+                    else 0.0
+                ),
+                "trajectory_projection_mean_scale": (
+                    trajectory_projection_scale_sum / float(trajectory_projection_steps)
+                    if trajectory_projection_steps
+                    else 1.0
+                ),
+                "trajectory_projection_min_scale": trajectory_projection_min_scale,
             }
         )
         if final_validation_loss is not None:
@@ -1766,11 +3196,40 @@ def main() -> None:
         if reference_eval_loss is not None:
             summary["reference_test_loss"] = reference_eval_loss
             summary["reference_eval_loss"] = reference_eval_loss
+        summary.update(extra_eval_kl_metrics)
         unwrapped_model = accelerator.unwrap_model(model)
         parameter_change_metrics = {
             **trainable_parameter_delta_metrics(unwrapped_model, theta0),
             **lora_model_delta_metrics(unwrapped_model),
         }
+        if reference_fisher_result is not None:
+            final_theta = flatten_trainable_parameters(unwrapped_model)
+            final_delta = final_theta - theta0
+            fisher = reference_fisher_result.tensor.float()
+            final_fisher_cost = float(
+                (0.5 * torch.dot(final_delta.float(), fisher * final_delta.float())).item()
+            )
+            final_norm_cost = float(0.5 * torch.dot(final_delta.float(), final_delta.float()).item())
+            parameter_change_metrics.update(
+                {
+                    "trained_lora_fisher_cost": final_fisher_cost,
+                    "trained_lora_norm_cost": final_norm_cost,
+                    **constraint_audit(
+                        cost=final_fisher_cost,
+                        budget=args.safe_rho,
+                        prefix="final_cumulative_reference",
+                    ),
+                    **constraint_audit(
+                        cost=final_norm_cost,
+                        budget=(
+                            None
+                            if safe_training_epsilon is None
+                            else 0.5 * float(safe_training_epsilon) ** 2
+                        ),
+                        prefix="final_cumulative_norm",
+                    ),
+                }
+            )
         summary.update(parameter_change_metrics)
         append_jsonl(metrics_path, {"type": "final_parameter_change", **parameter_change_metrics})
         if args.skip_final_evaluation:
@@ -1787,6 +3246,7 @@ def main() -> None:
                 ood_eval_records=ood_eval_records,
                 reference_validation_records=reference_validation_records,
                 reference_eval_records=reference_eval_records,
+                extra_eval_record_sets=extra_eval_record_sets,
                 final_dir=final_dir,
                 output_dir=output_dir,
             )
@@ -1804,6 +3264,10 @@ def main() -> None:
                 prefix = "target_"
                 base_prefix = "base_target_"
                 delta_prefix = "target_delta_"
+            elif key.startswith("extra_eval_"):
+                prefix = "extra_eval_"
+                base_prefix = "base_extra_eval_"
+                delta_prefix = "extra_eval_delta_"
             else:
                 continue
             metric_name = key.removeprefix(prefix)

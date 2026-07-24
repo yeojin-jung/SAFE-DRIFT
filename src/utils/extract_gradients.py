@@ -7,15 +7,32 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+def resolve_model_dtype(value: str | torch.dtype | None) -> torch.dtype:
+    if isinstance(value, torch.dtype):
+        return value
+    lowered = "float32" if value is None else str(value).strip().lower()
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    if lowered not in mapping:
+        raise ValueError(f"Unsupported model dtype: {value}")
+    return mapping[lowered]
+
+
 def load_model_with_lora(model_name, lora_r, lora_alpha, lora_dropout,
-                         lora_target_modules, device):
+                         lora_target_modules, device, torch_dtype=None):
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,
+        torch_dtype=resolve_model_dtype(torch_dtype),
     )
     required_vocab_size = max(tokenizer.get_vocab().values()) + 1
     if base_model.get_input_embeddings().weight.shape[0] < required_vocab_size:
@@ -279,10 +296,27 @@ def compute_projected_reference_fisher(
     if not reference_exemplars:
         raise ValueError("reference_exemplars must not be empty.")
 
+    raw_weights = [example.get("reference_fisher_weight") for example in reference_exemplars]
+    if any(weight is not None for weight in raw_weights):
+        if not all(weight is not None for weight in raw_weights):
+            raise ValueError(
+                "reference_fisher_weight must be present on every reference example "
+                "or on none of them."
+            )
+        weights = torch.tensor([float(weight) for weight in raw_weights], dtype=torch.float32)
+        if bool((weights < 0.0).any()):
+            raise ValueError("reference_fisher_weight values must be nonnegative.")
+        weight_total = float(weights.sum().item())
+        if weight_total <= 0.0:
+            raise ValueError("reference_fisher_weight values must have positive total mass.")
+        weights = weights / weight_total
+    else:
+        weights = torch.full((len(reference_exemplars),), 1.0 / float(len(reference_exemplars)))
+
     model.eval()
     fisher_sum = None
 
-    for example in tqdm(reference_exemplars, desc="Computing projected reference Fisher"):
+    for row_idx, example in enumerate(tqdm(reference_exemplars, desc="Computing projected reference Fisher")):
         feature = compute_projected_feature(
             model=model,
             tokenizer=tokenizer,
@@ -295,8 +329,7 @@ def compute_projected_reference_fisher(
             chunk_size=chunk_size,
             output_dtype=torch.float32,
         )
-        squared = feature.square()
+        squared = feature.square() * weights[row_idx].to(device=feature.device, dtype=feature.dtype)
         fisher_sum = squared if fisher_sum is None else fisher_sum + squared
 
-    fisher = fisher_sum / float(len(reference_exemplars))
-    return fisher.to(dtype=output_dtype)
+    return fisher_sum.to(dtype=output_dtype)

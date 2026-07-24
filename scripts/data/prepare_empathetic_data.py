@@ -51,6 +51,9 @@ class BuildConfig:
     max_reference_examples: int
     max_reference_validation_examples: int
     max_reference_test_examples: int
+    target_order_seed: int | None
+    candidate_sample_seed: int | None
+    legacy_reuse_reference_for_eval: bool
     target_splits: list[str]
     overwrite: bool
 
@@ -414,18 +417,27 @@ def build_dataset(out_dir: Path, config: BuildConfig) -> tuple[dict[str, int], d
         target_records,
         train_count=config.max_target_train,
         eval_count=config.max_target_eval,
-        seed=config.seed + 1,
+        seed=config.seed + 1 if config.target_order_seed is None else config.target_order_seed,
     )
 
     print("[candidate] formatting Empathetic Dialogues split=train ...", file=sys.stderr)
     candidate_records = unique_records(format_empathetic_dialogues("train"))
-    candidates, candidate_validation, candidate_test = split_primary_validation_test(
-        candidate_records,
-        primary_count=config.max_candidates,
-        validation_count=config.max_candidate_validation,
-        test_count=config.max_candidate_test,
-        seed=config.seed + 3,
-    )
+    if (
+        config.max_candidates <= 0
+        and config.max_candidate_validation <= 0
+        and config.max_candidate_test <= 0
+    ):
+        candidates = list(candidate_records)
+        candidate_validation = []
+        candidate_test = []
+    else:
+        candidates, candidate_validation, candidate_test = split_primary_validation_test(
+            candidate_records,
+            primary_count=config.max_candidates,
+            validation_count=config.max_candidate_validation,
+            test_count=config.max_candidate_test,
+            seed=config.seed + 3 if config.candidate_sample_seed is None else config.candidate_sample_seed,
+        )
 
     print("[reference] formatting GSM8K ...", file=sys.stderr)
     reference_total = (
@@ -434,13 +446,18 @@ def build_dataset(out_dir: Path, config: BuildConfig) -> tuple[dict[str, int], d
         + int(config.max_reference_test_examples)
     )
     references = format_gsm8k(reference_total, config.seed + stable_int("gsm8k"))
-    reference_fit, reference_validation, reference_test = split_primary_validation_test(
-        references,
-        primary_count=config.max_reference_examples,
-        validation_count=config.max_reference_validation_examples,
-        test_count=config.max_reference_test_examples,
-        seed=config.seed + stable_int("gsm8k:reference_split"),
-    )
+    if config.legacy_reuse_reference_for_eval:
+        reference_fit = list(references)
+        reference_validation = list(references)
+        reference_test = list(references)
+    else:
+        reference_fit, reference_validation, reference_test = split_primary_validation_test(
+            references,
+            primary_count=config.max_reference_examples,
+            validation_count=config.max_reference_validation_examples,
+            test_count=config.max_reference_test_examples,
+            seed=config.seed + stable_int("gsm8k:reference_split"),
+        )
 
     overlap_checks: dict[str, int] = {}
     overlap_checks.update(
@@ -460,15 +477,18 @@ def build_dataset(out_dir: Path, config: BuildConfig) -> tuple[dict[str, int], d
             }
         )
     )
-    overlap_checks.update(
-        assert_disjoint_split_sets(
-            {
-                "reference_fit_gsm8k": reference_fit,
-                "reference_validation_gsm8k": reference_validation,
-                "reference_test_gsm8k": reference_test,
-            }
+    if config.legacy_reuse_reference_for_eval:
+        overlap_checks["reference_legacy_shared_count"] = len(reference_fit)
+    else:
+        overlap_checks.update(
+            assert_disjoint_split_sets(
+                {
+                    "reference_fit_gsm8k": reference_fit,
+                    "reference_validation_gsm8k": reference_validation,
+                    "reference_test_gsm8k": reference_test,
+                }
+            )
         )
-    )
 
     counts = {
         "target_all": write_jsonl(out_dir / "target_all.jsonl", target_all),
@@ -506,6 +526,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-reference-examples", type=int, default=258)
     parser.add_argument("--max-reference-validation-examples", type=int, default=0)
     parser.add_argument("--max-reference-test-examples", type=int, default=0)
+    parser.add_argument("--target-order-seed", type=int, default=None)
+    parser.add_argument("--candidate-sample-seed", type=int, default=None)
+    parser.add_argument("--legacy-reuse-reference-for-eval", action="store_true")
     parser.add_argument("--target-splits", default="validation,test")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
@@ -529,6 +552,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_reference_examples=args.max_reference_examples,
         max_reference_validation_examples=args.max_reference_validation_examples,
         max_reference_test_examples=args.max_reference_test_examples,
+        target_order_seed=args.target_order_seed,
+        candidate_sample_seed=args.candidate_sample_seed,
+        legacy_reuse_reference_for_eval=bool(args.legacy_reuse_reference_for_eval),
         target_splits=parse_csv_list(args.target_splits),
         overwrite=bool(args.overwrite),
     )
@@ -554,6 +580,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reference_eval_file": "reference_eval/gsm8k_test.jsonl",
         },
         "reference_split_policy": (
+            "Legacy reproduction: the same GSM8K sample is used for reference fitting and "
+            "evaluation."
+            if config.legacy_reuse_reference_for_eval
+            else
             "GSM8K reference_prompts, reference_validation, and reference_test are sampled "
             "as disjoint splits. The OOD drift evaluator uses reference_eval/gsm8k_test.jsonl, "
             "which is the same held-out split as reference_test.jsonl and is not used for "

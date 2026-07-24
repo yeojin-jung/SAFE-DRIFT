@@ -6,8 +6,11 @@ seed: 42
 
 selector_feature_method: low_rank
 selector_preconditioner: adam
+# Legacy behavior remains the default. Set this to
+# precondition_before_projection for U_K^T D_0^{-1} g candidate features.
+adam_selection_mode: post_projection
 safe_geometry: reference
-safe_solver: greedy_marginal
+safe_solver: constrained_greedy
 save_selected_artifacts: false
 
 max_seq_len: 2048

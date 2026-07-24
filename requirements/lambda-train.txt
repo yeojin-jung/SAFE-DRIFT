@@ -1,0 +1,13 @@
+accelerate==1.2.1
+clarabel>=0.10,<1
+cvxpy>=1.6,<2
+datasets==3.2.0
+matplotlib>=3.8,<4
+numpy==1.24.4
+peft==0.14.0
+PyYAML>=6,<7
+rouge-score>=0.1.2,<1
+safetensors>=0.4,<1
+sentencepiece>=0.2,<1
+transformers==4.48.3
+tqdm>=4.66,<5

@@ -1,13 +1,16 @@
 experiment:
-  id: setting_3_empathetic_esconv_gsm8k_legacy
-  name: "Setting 3 legacy reproduction: EmpatheticDialogues / ESConv / GSM8K"
+  id: setting_3_selector_trajectory_grid_20260724
+  name: "Setting 3 selector and trajectory constraint sweep"
+
+# Reuse the compatible legacy caches. Corrected Adam features receive a
+# separate cache suffix in make_rebuttal_command_arrays.py.
+shared_cache_experiment_id: setting_3_empathetic_esconv_gsm8k_legacy
+output_root: outputs/setting_3_selector_trajectory_grid_20260724
 
 repeats:
   - repeat_index: 0
     repeat_seed: 42
     run_seed: 42
-    target_order_seed: 1042
-    candidate_sample_seed: 2042
     target_split_seed: 3042
     reference_split_seed: 4042
     preconditioner_split_seed: 5042
@@ -16,8 +19,6 @@ repeats:
   - repeat_index: 1
     repeat_seed: 43
     run_seed: 43
-    target_order_seed: 1043
-    candidate_sample_seed: 2043
     target_split_seed: 3043
     reference_split_seed: 4043
     preconditioner_split_seed: 5043
@@ -26,8 +27,6 @@ repeats:
   - repeat_index: 2
     repeat_seed: 44
     run_seed: 44
-    target_order_seed: 1044
-    candidate_sample_seed: 2044
     target_split_seed: 3044
     reference_split_seed: 4044
     preconditioner_split_seed: 5044
@@ -36,8 +35,6 @@ repeats:
   - repeat_index: 3
     repeat_seed: 45
     run_seed: 45
-    target_order_seed: 1045
-    candidate_sample_seed: 2045
     target_split_seed: 3045
     reference_split_seed: 4045
     preconditioner_split_seed: 5045
@@ -46,8 +43,6 @@ repeats:
   - repeat_index: 4
     repeat_seed: 46
     run_seed: 46
-    target_order_seed: 1046
-    candidate_sample_seed: 2046
     target_split_seed: 3046
     reference_split_seed: 4046
     preconditioner_split_seed: 5046
@@ -56,38 +51,8 @@ repeats:
 
 seed: "{run_seed}"
 
-prepare:
-  - command:
-      - python
-      - scripts/data/prepare_empathetic_data.py
-      - --out
-      - data/setting_3_empathetic_esconv_gsm8k/legacy_prepared_{repeat_tag}
-      - --seed
-      - "{run_seed}"
-      - --target-order-seed
-      - "{target_order_seed}"
-      - --candidate-sample-seed
-      - "{candidate_sample_seed}"
-      - --target-splits
-      - train,validation,test
-      - --max-target-train
-      - "100"
-      - --max-candidates
-      - "0"
-      - --max-candidate-validation
-      - "0"
-      - --max-candidate-test
-      - "0"
-      - --max-target-eval
-      - "0"
-      - --max-reference-examples
-      - "256"
-      - --max-reference-validation-examples
-      - "128"
-      - --max-reference-test-examples
-      - "128"
-      - --overwrite
-
+# The currently prepared seed-specific pools are reused so that this sweep
+# remains compatible with the existing gradients.
 data:
   candidate_file: data/setting_3_empathetic_esconv_gsm8k/legacy_prepared_{repeat_tag}/candidate_pool.jsonl
   target_file: data/setting_3_empathetic_esconv_gsm8k/legacy_prepared_{repeat_tag}/target_all.jsonl
@@ -101,11 +66,8 @@ model_variants:
     gradient_model: allenai/OLMo-2-1124-7B-Instruct
     finetune_model: allenai/OLMo-2-1124-7B-Instruct
     enabled: true
-  - name: olmo7b_base_to_instruct_transfer
-    gradient_model: allenai/OLMo-2-1124-7B
-    finetune_model: allenai/OLMo-2-1124-7B-Instruct
-    enabled: false
 
+run_baselines: true
 baseline_selectors: ["random", "dsir", "less", "prismatic"]
 baseline_variants:
   - name: random
@@ -136,6 +98,7 @@ baseline_variants:
   - name: prismatic_kl_1.0
     selector: prismatic
     kl_regularization_lambda: 1.0
+
 subset_percentages: [20.0]
 
 splits:
@@ -147,6 +110,7 @@ splits:
 selection:
   selector_feature_method: low_rank
   selector_preconditioner: adam
+  adam_selection_mode: post_projection
   preconditioner_split_seed: "{preconditioner_split_seed}"
   selector_projection_seed: 13
   save_selected_artifacts: true
@@ -166,8 +130,12 @@ selection:
   low_rank_candidate_max_examples: 512
   low_rank_candidate_projection_chunk_rows: 128
   safe_geometry: reference
-  safe_solver: greedy_marginal
   safe_learning_rate: 2.0e-4
+  safe_feasibility_tolerance: 1.0e-6
+  safe_objective_tolerance: 1.0e-12
+  safe_greedy_swap_passes: 1
+  safe_epsilon_calibration_samples: 64
+  safe_epsilon_calibration_seed: "{candidate_subsample_seed}"
   compute_validation_gradient: true
   compute_reference_fisher: true
 
@@ -178,30 +146,48 @@ rank_grid:
     K: 80
 
 safe:
-  epsilon: 1.0
-  epsilon_values: [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0]
-  rho_values: [1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0]
+  epsilon: null
+  rho_values: []
   variants:
-    - name: safe_reference_precondadam
-      selector_feature_method: low_rank
-      selector_preconditioner: adam
-      safe_geometry: reference
+    - name: safe_original_greedy
       safe_solver: greedy_marginal
-    - name: safe_reference_precondsgd
-      selector_feature_method: low_rank
-      selector_preconditioner: sgd
-      safe_geometry: reference
-      safe_solver: greedy_marginal
-    - name: safe_euclidean_precondadam
-      selector_feature_method: low_rank
-      selector_preconditioner: adam
-      safe_geometry: euclidean
-      safe_solver: greedy_marginal
-    - name: safe_euclidean_precondsgd
-      selector_feature_method: low_rank
-      selector_preconditioner: sgd
-      safe_geometry: euclidean
-      safe_solver: greedy_marginal
+      adam_selection_mode: post_projection
+      safe_training_constraint_mode: none
+      epsilon_multipliers: [0.5, 1.0, 2.0]
+      gamma_values: [0.01, 0.1, 1.0]
+    - name: safe_constrained_greedy
+      safe_solver: constrained_greedy
+      adam_selection_mode: post_projection
+      safe_training_constraint_mode: none
+      epsilon_multipliers: [0.5, 1.0, 2.0]
+      gamma_values: [0.01, 0.1, 1.0]
+    - name: safe_relaxed
+      safe_solver: relaxed
+      adam_selection_mode: post_projection
+      safe_training_constraint_mode: none
+      epsilon_multipliers: [0.5, 1.0, 2.0]
+      gamma_values: [0.01, 0.1, 1.0]
+    - name: safe_adam_corrected
+      safe_solver: constrained_greedy
+      adam_selection_mode: precondition_before_projection
+      safe_training_constraint_mode: none
+      epsilon_multipliers: [0.5, 1.0, 2.0]
+      gamma_values: [0.01, 0.1, 1.0]
+    - name: safe_trajectory_cumulative
+      safe_solver: constrained_greedy
+      adam_selection_mode: post_projection
+      safe_training_constraint_mode: cumulative_line_search
+      safe_training_epsilon_scale_by_steps: true
+      epsilon_multipliers: [1.0, 5.0]
+      rho_values: [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0]
+    - name: safe_trajectory_equal_allocation
+      safe_solver: constrained_greedy
+      adam_selection_mode: post_projection
+      safe_training_constraint_mode: equal_allocation
+      safe_training_epsilon_scale_by_steps: true
+      epsilon_multipliers: [1.0, 5.0]
+      rho_values: [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0]
+
 training:
   train_lora_r: 8
   train_lora_alpha: 16
@@ -213,6 +199,11 @@ training:
   trajectory_eval_steps: 10
   trajectory_reference_max_examples: 64
   trajectory_target_max_examples: 64
+  trajectory_generation_eval_steps: 10
+  trajectory_generation_max_examples: 16
+  trajectory_generation_max_new_tokens: 32
+  trajectory_target_evaluator: esconv
+  trajectory_reference_evaluator: gsm8k
   kl_reference_max_examples: 128
 
 evaluation:

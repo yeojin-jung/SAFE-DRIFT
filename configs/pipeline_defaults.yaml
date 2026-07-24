@@ -18,6 +18,9 @@ selection:
   max_seq_len: 1024
   selector_feature_method: low_rank
   selector_preconditioner: adam
+  # Set to precondition_before_projection for the corrected frozen-Adam
+  # selector; its effective scale is derived from the training LR schedule.
+  adam_selection_mode: post_projection
   save_selected_artifacts: false
   # Random-sketch feature parameters. These are ignored when
   # selector_feature_method: low_rank, but kept here for explicit ablations.
@@ -38,7 +41,7 @@ selection:
   reference_fisher_max_examples: 1024
   validation_gradient_max_examples: 256
   safe_geometry: reference
-  safe_solver: greedy_marginal
+  safe_solver: constrained_greedy
   safe_learning_rate: 1.0
 
 safe:

@@ -296,6 +296,25 @@ SAFE runs also report `safe_constraint_report` in the sweep manifest, including
 the alpha case and whether the continuous update and selected subset satisfy
 the rho/reference and epsilon/norm budgets.
 
+### Final-Trajectory Constraints
+
+By default, `rho` and `epsilon` constrain selection but do not alter optimizer
+updates. Set `safe_training_constraint_mode` in a YAML training or SAFE variant,
+or pass `--safe-training-constraint-mode`, to enforce the constraints during
+LoRA training:
+
+```text
+none                    existing unconstrained training behavior
+cumulative_line_search  largest s in [0,1] keeping theta_t-theta_0 in both budgets
+equal_allocation        per-step epsilon/T and rho/T^2 worst-case allocation
+```
+
+The cumulative line search is anchored at the base LoRA parameters and includes
+the cross terms with all preceding updates. Each optimizer step records the raw
+proposal, accepted scale, active constraint, projection error, and proposed
+versus accepted cumulative costs in `metrics.jsonl`. The fixed reference Fisher
+cost is the enforced surrogate; held-out KL remains a realized-drift diagnostic.
+
 ## Outputs
 
 Outputs are written under:

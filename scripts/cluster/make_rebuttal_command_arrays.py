@@ -20,6 +20,7 @@ VALUE_FLAGS = {
     "--reference-file",
     "--reference-validation-file",
     "--reference-test-file",
+    "--reference-composition-name",
     "--reference-hf-subset",
     "--reference-hf-split",
     "--reference-hf-label",
@@ -41,9 +42,13 @@ VALUE_FLAGS = {
     "--less-similarity",
     "--selector-feature-method",
     "--selector-preconditioner",
+    "--adam-selection-mode",
+    "--adam-selection-effective-learning-rate",
     "--adam-beta2",
     "--adam-eps",
     "--adam-warmup-steps",
+    "--selection-candidate-max-examples",
+    "--selection-candidate-subsample-seed",
     "--preconditioner-split-seed",
     "--selector-projection-dim",
     "--selector-projection-seed",
@@ -54,8 +59,19 @@ VALUE_FLAGS = {
     "--safe-geometry",
     "--safe-solver",
     "--safe-shortlist-size",
+    "--safe-feasibility-tolerance",
+    "--safe-objective-tolerance",
+    "--safe-greedy-swap-passes",
+    "--safe-relaxed-cvx-solver",
+    "--safe-relaxed-weight-threshold",
     "--safe-cost-c",
+    "--safe-cost-beta",
+    "--safe-cost-gamma",
     "--safe-epsilon",
+    "--safe-epsilon-multiplier",
+    "--safe-epsilon-calibration-samples",
+    "--safe-epsilon-calibration-seed",
+    "--safe-training-constraint-mode",
     "--reference-fisher-max-examples",
     "--low-rank-reference-rank",
     "--low-rank-builder-alpha",
@@ -86,6 +102,11 @@ VALUE_FLAGS = {
     "--logging-steps",
     "--eval-steps",
     "--save-steps",
+    "--kl-regularization-lambda",
+    "--kl-reference-max-examples",
+    "--trajectory-eval-steps",
+    "--trajectory-reference-max-examples",
+    "--trajectory-target-max-examples",
     "--evaluator",
     "--ood-evaluator",
     "--reference-evaluator",
@@ -122,12 +143,14 @@ VALUE_FLAGS = {
 MULTI_FLAGS = {
     "--target-split-proportions",
     "--reference-split-proportions",
+    "--reference-composition-domains",
     "--selectors",
     "--subset-percentages",
     "--lora-target-modules",
     "--train-lora-target-modules",
     "--humaneval-pass-at-ks",
     "--benchmark-evals",
+    "--extra-evals",
 }
 
 BOOL_FLAGS = {
@@ -141,6 +164,8 @@ BOOL_FLAGS = {
     "--skip-final-evaluation",
     "--save-selected-artifacts",
     "--no-save-selected-artifacts",
+    "--plot-update-trajectory",
+    "--no-plot-update-trajectory",
     "--run-entanglement-analysis",
     "--no-run-entanglement-analysis",
     "--safe-average-by-budget",
@@ -154,6 +179,8 @@ BOOL_FLAGS = {
     "--compute-validation-gradient",
     "--compute-reference-fisher",
     "--compute-entanglement-metrics",
+    "--safe-training-epsilon-scale-by-steps",
+    "--no-safe-training-epsilon-scale-by-steps",
 }
 
 
@@ -236,6 +263,9 @@ def command_map(command: list[str]) -> dict[str, tuple[str, ...] | bool]:
 
 def relative_output_parts(entry: dict[str, Any]) -> list[str]:
     name_parts = str(entry["name"]).split("/")
+    shared_cache_experiment_id = entry.get("shared_cache_experiment_id")
+    if shared_cache_experiment_id is not None and name_parts:
+        name_parts[0] = str(shared_cache_experiment_id)
     if len(name_parts) >= 5:
         return name_parts[:5]
     return name_parts
@@ -254,6 +284,10 @@ def shared_feature_cache_path(
     reference_seed = safe_slug(get_value(command, "--reference-split-seed", "42"))
     projection_seed = safe_slug(get_value(command, "--selector-projection-seed", "13"))
     shared_tag = f"{method}_target{target_seed}_ref{reference_seed}_proj{projection_seed}"
+    adam_mode = get_value(command, "--adam-selection-mode", "post_projection")
+    preconditioner = get_value(command, "--selector-preconditioner", "adam")
+    if preconditioner == "adam" and adam_mode == "precondition_before_projection":
+        shared_tag += "_adam_precondition_before_projection"
     root = (project_dir / shared_cache_root / Path(*prefix) / shared_tag).resolve()
     return root / "selector_feature_cache"
 
@@ -346,14 +380,36 @@ def is_same_cache_prep(left: dict[str, Any], right: dict[str, Any]) -> bool:
         "--train-cache-dir",
         "--safe-alpha",
         "--safe-cost-c",
+        "--safe-cost-beta",
+        "--safe-cost-gamma",
         "--safe-epsilon",
+        "--safe-epsilon-multiplier",
+        "--safe-epsilon-calibration-samples",
+        "--safe-epsilon-calibration-seed",
         "--safe-geometry",
         "--safe-solver",
         "--safe-learning-rate",
+        "--safe-feasibility-tolerance",
+        "--safe-objective-tolerance",
+        "--safe-greedy-swap-passes",
+        "--safe-relaxed-cvx-solver",
+        "--safe-relaxed-weight-threshold",
+        "--safe-training-constraint-mode",
+        "--safe-training-epsilon-scale-by-steps",
+        "--no-safe-training-epsilon-scale-by-steps",
         "--save-steps",
         "--selectors",
         "--selector-preconditioner",
+        "--kl-regularization-lambda",
+        "--kl-reference-max-examples",
+        "--trajectory-eval-steps",
+        "--trajectory-reference-max-examples",
+        "--trajectory-target-max-examples",
     }
+    left_mode = get_value(left["command"], "--adam-selection-mode", "post_projection")
+    right_mode = get_value(right["command"], "--adam-selection-mode", "post_projection")
+    if "precondition_before_projection" in {left_mode, right_mode}:
+        ignored.remove("--selector-preconditioner")
     for key in set(left_map) | set(right_map):
         if key in ignored:
             continue
@@ -424,6 +480,7 @@ def main() -> int:
             else:
                 expanded_runs.append(copy.deepcopy(entry))
 
+        base_eval_keys: set[tuple[str, str, str, str]] = set()
         for entry in expanded_runs:
             command = list(entry["command"])
             transform_common(
@@ -434,8 +491,16 @@ def main() -> int:
                 save_steps=args.save_steps,
                 run_entanglement_analysis=False,
             )
-            if entry.get("kind") == "safe":
+            base_eval_key = (
+                str(entry.get("repeat_tag") or entry.get("repeat_seed") or "default"),
+                str(get_value(command, "--train-model-name", get_value(command, "--model-name", ""))),
+                str(get_value(command, "--target-split-seed", "")),
+                str(get_value(command, "--reference-split-seed", "")),
+            )
+            if base_eval_key in base_eval_keys:
                 add_bool(command, "--skip-base-eval")
+            else:
+                base_eval_keys.add(base_eval_key)
             run_output = Path(get_value(command, "--output-dir") or "")
             entry["command"] = command
             entry["done_file"] = str((run_output / "selector_sft_sweep_manifest.json").resolve())

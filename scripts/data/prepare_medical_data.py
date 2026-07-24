@@ -27,10 +27,10 @@ from typing import Any, Iterable, Sequence
 try:
     from datasets import load_dataset
 except Exception as exc:  # pragma: no cover
-    raise SystemExit(
-        "Could not import `datasets`. Install the environment first.\n"
-        f"Original import error: {exc}"
-    )
+    load_dataset = None
+    DATASETS_IMPORT_ERROR = exc
+else:
+    DATASETS_IMPORT_ERROR = None
 
 
 MEDQA_SOURCE = "davidheineman/medqa-en"
@@ -87,7 +87,12 @@ class BuildConfig:
     max_reference_validation_per_dataset: int
     max_reference_test_per_dataset: int
     reference_fisher_max_total: int | None
+    reference_mixture_total_budget: int | None
+    target_sample_seed: int | None
+    legacy_reuse_reference_for_eval: bool
     reference_datasets: list[str]
+    eval_only_datasets: list[str]
+    reference_mixtures: list[dict[str, Any]]
     candidate_source: str
     overwrite: bool
 
@@ -98,6 +103,11 @@ def stable_hash(text: str, length: int = 16) -> str:
 
 def stable_int(text: str) -> int:
     return int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def safe_slug(value: Any) -> str:
+    text = str(value)
+    return "".join(char if char.isalnum() or char in "._-" else "_" for char in text).strip("_") or "value"
 
 
 def clean_text(value: Any) -> str:
@@ -121,6 +131,11 @@ def clean_text(value: Any) -> str:
 
 
 def load_hf_dataset(repo: str, *args: Any, split: str, **kwargs: Any):
+    if load_dataset is None:
+        raise RuntimeError(
+            "Could not import `datasets`. Install the environment first.\n"
+            f"Original import error: {DATASETS_IMPORT_ERROR}"
+        )
     kwargs.setdefault("trust_remote_code", True)
     try:
         return load_dataset(repo, *args, split=split, **kwargs)
@@ -179,6 +194,102 @@ def split_primary_validation_test(
     validation = ordered[primary_count : primary_count + validation_count]
     test = ordered[primary_count + validation_count : primary_count + validation_count + test_count]
     return primary, validation, test
+
+
+def parse_reference_mixture_specs(raw: str) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for item in [part.strip() for part in str(raw or "").split(",") if part.strip()]:
+        if "=" not in item:
+            raise ValueError(
+                "Reference mixture specs must use NAME=dataset+dataset syntax; "
+                f"got {item!r}."
+            )
+        name, dataset_expr = item.split("=", 1)
+        datasets = [part.strip() for part in dataset_expr.split("+") if part.strip()]
+        if not name.strip() or len(datasets) < 1:
+            raise ValueError(f"Invalid reference mixture spec: {item!r}")
+        specs.append({"name": name.strip(), "datasets": datasets})
+    return specs
+
+
+def balanced_domain_counts(total_budget: int, domains: Sequence[str]) -> dict[str, int]:
+    if total_budget <= 0:
+        raise ValueError("reference_mixture_total_budget must be positive.")
+    if not domains:
+        raise ValueError("Reference mixtures require at least one domain.")
+    base = int(total_budget) // len(domains)
+    remainder = int(total_budget) % len(domains)
+    return {
+        domain: base + (1 if index < remainder else 0)
+        for index, domain in enumerate(domains)
+    }
+
+
+def with_reference_mixture_metadata(
+    record: dict[str, Any],
+    *,
+    mixture_name: str,
+    domains: Sequence[str],
+    domain: str,
+    domain_count: int,
+) -> dict[str, Any]:
+    if domain_count <= 0:
+        raise ValueError("domain_count must be positive.")
+    out = dict(record)
+    metadata = dict(out.get("metadata") or {})
+    metadata.update(
+        {
+            "reference_mixture": mixture_name,
+            "reference_mixture_domains": list(domains),
+            "reference_mixture_domain": domain,
+            "reference_mixture_domain_count": int(domain_count),
+            "reference_mixture_domain_weight": 1.0 / float(len(domains)),
+        }
+    )
+    out["metadata"] = metadata
+    out["reference_mixture"] = mixture_name
+    out["reference_mixture_domains"] = list(domains)
+    out["reference_fisher_domain"] = domain
+    out["reference_fisher_weight"] = 1.0 / (float(len(domains)) * float(domain_count))
+    return out
+
+
+def build_reference_mixture_records(
+    *,
+    records_by_dataset: dict[str, list[dict[str, Any]]],
+    mixture_name: str,
+    domains: Sequence[str],
+    total_budget: int,
+    seed: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    per_domain_counts = balanced_domain_counts(total_budget, domains)
+    records: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for domain in domains:
+        available = records_by_dataset.get(domain, [])
+        desired = per_domain_counts[domain]
+        if len(available) < desired:
+            raise ValueError(
+                f"Reference mixture {mixture_name!r} requested {desired} examples "
+                f"from {domain!r}, but only {len(available)} supervised fit examples are available."
+            )
+        selected = sample_records(
+            available,
+            desired,
+            seed + stable_int(f"reference_mixture:{mixture_name}:{domain}"),
+        )
+        counts[domain] = len(selected)
+        records.extend(
+            with_reference_mixture_metadata(
+                record,
+                mixture_name=mixture_name,
+                domains=domains,
+                domain=domain,
+                domain_count=len(selected),
+            )
+            for record in selected
+        )
+    return shuffle_records(records, seed + stable_int(f"reference_mixture:{mixture_name}")), counts
 
 
 def choice_labels(num_choices: int) -> list[str]:
@@ -524,24 +635,44 @@ def build_reference_artifacts(out_dir: Path, config: BuildConfig) -> dict[str, i
     reference_test_records: list[dict[str, Any]] = []
     mcq_ood_validation_records: list[dict[str, Any]] = []
     mcq_ood_test_records: list[dict[str, Any]] = []
+    fit_records_by_dataset: dict[str, list[dict[str, Any]]] = {}
 
-    for name in config.reference_datasets:
+    all_datasets = list(dict.fromkeys(config.reference_datasets + config.eval_only_datasets))
+    for name in all_datasets:
         if name not in builders:
             raise ValueError(f"Unknown reference dataset {name!r}. Choose from {sorted(builders)}.")
         print(f"[reference] formatting {name} ...", file=sys.stderr)
-        total_count = (
-            int(config.max_reference_per_dataset)
-            + int(config.max_reference_validation_per_dataset)
-            + int(config.max_reference_test_per_dataset)
-        )
+        eval_only = name in config.eval_only_datasets
+        fit_count = 0 if eval_only else int(config.max_reference_per_dataset)
+        total_count = fit_count
+        if not config.legacy_reuse_reference_for_eval:
+            total_count += (
+                int(config.max_reference_validation_per_dataset)
+                + int(config.max_reference_test_per_dataset)
+            )
         records = builders[name](total_count, config.seed + stable_int(name))
-        reference_fit, reference_validation, reference_test = split_primary_validation_test(
-            records,
-            primary_count=config.max_reference_per_dataset,
-            validation_count=config.max_reference_validation_per_dataset,
-            test_count=config.max_reference_test_per_dataset,
-            seed=config.seed + stable_int(f"{name}:reference_split"),
-        )
+        if eval_only:
+            ordered = shuffle_records(
+                records,
+                config.seed + stable_int(f"{name}:eval_only_split"),
+            )
+            validation_count = max(0, int(config.max_reference_validation_per_dataset))
+            test_count = max(0, int(config.max_reference_test_per_dataset))
+            reference_fit = []
+            reference_validation = ordered[:validation_count]
+            reference_test = ordered[validation_count : validation_count + test_count]
+        elif config.legacy_reuse_reference_for_eval:
+            reference_fit = list(records)
+            reference_validation = list(records)
+            reference_test = list(records)
+        else:
+            reference_fit, reference_validation, reference_test = split_primary_validation_test(
+                records,
+                primary_count=fit_count,
+                validation_count=config.max_reference_validation_per_dataset,
+                test_count=config.max_reference_test_per_dataset,
+                seed=config.seed + stable_int(f"{name}:reference_split"),
+            )
         counts[f"reference_source/{name}/fit"] = len(reference_fit)
         counts[f"reference_source/{name}/validation"] = write_jsonl(
             eval_dir / f"{name}_validation.jsonl",
@@ -552,11 +683,15 @@ def build_reference_artifacts(out_dir: Path, config: BuildConfig) -> dict[str, i
         if name in {"mmlu_non_medical", "bbq"}:
             mcq_ood_validation_records.extend(reference_validation)
             mcq_ood_test_records.extend(reference_test)
+        if eval_only:
+            continue
+        supervised_fit = [record for record in reference_fit if has_supervised_target(record)]
+        fit_records_by_dataset[name] = supervised_fit
         if name == "ifeval":
             reference_validation_records.extend(reference_validation)
             reference_test_records.extend(reference_test)
             continue
-        fisher_records.extend([record for record in reference_fit if has_supervised_target(record)])
+        fisher_records.extend(supervised_fit)
         reference_validation_records.extend([record for record in reference_validation if has_supervised_target(record)])
         reference_test_records.extend([record for record in reference_test if has_supervised_target(record)])
 
@@ -570,6 +705,22 @@ def build_reference_artifacts(out_dir: Path, config: BuildConfig) -> dict[str, i
 
     counts["reference_prompt_supervised_pool"] = len(supervised_fisher_pool)
     counts["reference_prompts"] = write_jsonl(out_dir / "reference_prompts.jsonl", fisher_records)
+    reference_validation_records = shuffle_records(
+        reference_validation_records,
+        config.seed + stable_int("reference_validation_combined"),
+    )
+    reference_test_records = shuffle_records(
+        reference_test_records,
+        config.seed + stable_int("reference_test_combined"),
+    )
+    mcq_ood_validation_records = shuffle_records(
+        mcq_ood_validation_records,
+        config.seed + stable_int("mcq_ood_validation_combined"),
+    )
+    mcq_ood_test_records = shuffle_records(
+        mcq_ood_test_records,
+        config.seed + stable_int("mcq_ood_test_combined"),
+    )
     counts["reference_validation"] = write_jsonl(out_dir / "reference_validation.jsonl", reference_validation_records)
     counts["reference_test"] = write_jsonl(out_dir / "reference_test.jsonl", reference_test_records)
     counts["reference_eval/mcq_ood_validation"] = write_jsonl(
@@ -578,13 +729,42 @@ def build_reference_artifacts(out_dir: Path, config: BuildConfig) -> dict[str, i
     )
     counts["reference_eval/mcq_ood_test"] = write_jsonl(eval_dir / "mcq_ood_test.jsonl", mcq_ood_test_records)
     counts["reference_eval/mcq_ood_eval"] = write_jsonl(eval_dir / "mcq_ood_eval.jsonl", mcq_ood_test_records)
+    if config.reference_mixtures:
+        if config.reference_mixture_total_budget is None:
+            raise ValueError("--reference-mixtures requires --reference-mixture-total-budget.")
+        mixture_dir = out_dir / "reference_mixtures"
+        mixture_dir.mkdir(parents=True, exist_ok=True)
+        for spec in config.reference_mixtures:
+            mixture_name = str(spec["name"])
+            domains = [str(domain) for domain in spec["datasets"]]
+            unknown = [domain for domain in domains if domain not in fit_records_by_dataset]
+            if unknown:
+                raise ValueError(
+                    f"Reference mixture {mixture_name!r} uses datasets that were not "
+                    f"prepared for Fisher fitting: {unknown}."
+                )
+            mixture_records, per_domain_counts = build_reference_mixture_records(
+                records_by_dataset=fit_records_by_dataset,
+                mixture_name=mixture_name,
+                domains=domains,
+                total_budget=int(config.reference_mixture_total_budget),
+                seed=config.seed,
+            )
+            mixture_slug = safe_slug(mixture_name)
+            counts[f"reference_mixture/{mixture_slug}"] = write_jsonl(
+                mixture_dir / f"{mixture_slug}.jsonl",
+                mixture_records,
+            )
+            for domain, count in per_domain_counts.items():
+                counts[f"reference_mixture/{mixture_slug}/{domain}"] = count
     return counts
 
 
 def build_medical_dataset(out_dir: Path, config: BuildConfig) -> dict[str, int]:
     print("[medical] loading MedQA splits ...", file=sys.stderr)
     medqa_train_all = format_medqa_split("train", role="target_gradient")
-    target_train = sample_records(medqa_train_all, config.max_target_train, config.seed + 1)
+    target_seed = config.seed + 1 if config.target_sample_seed is None else config.target_sample_seed
+    target_train = sample_records(medqa_train_all, config.max_target_train, target_seed)
     target_train_ids = {record["id"] for record in target_train}
 
     print("[medical] loading MedQA dev/test ...", file=sys.stderr)
@@ -639,9 +819,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-reference-test-per-dataset", type=int, default=0)
     parser.add_argument("--reference-fisher-max-total", type=int, default=None)
     parser.add_argument(
+        "--reference-mixture-total-budget",
+        type=int,
+        default=None,
+        help="Fixed total Fisher examples per named reference mixture.",
+    )
+    parser.add_argument("--target-sample-seed", type=int, default=None)
+    parser.add_argument("--legacy-reuse-reference-for-eval", action="store_true")
+    parser.add_argument(
         "--reference-datasets",
         default=",".join(DEFAULT_REFERENCE_DATASETS),
         help="Comma-separated list from: gsm8k,mmlu_non_medical,ifeval,truthfulqa,bbq",
+    )
+    parser.add_argument(
+        "--eval-only-datasets",
+        default="",
+        help=(
+            "Comma-separated non-medical datasets prepared only for held-out evaluation, "
+            "never for the reference Fisher."
+        ),
+    )
+    parser.add_argument(
+        "--reference-mixtures",
+        default="",
+        help=(
+            "Comma-separated NAME=dataset+dataset specs. Each mixture is written under "
+            "reference_mixtures/ with exact per-domain Fisher weights."
+        ),
     )
     parser.add_argument(
         "--candidate-source",
@@ -670,7 +874,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_reference_validation_per_dataset=args.max_reference_validation_per_dataset,
         max_reference_test_per_dataset=args.max_reference_test_per_dataset,
         reference_fisher_max_total=args.reference_fisher_max_total,
+        reference_mixture_total_budget=args.reference_mixture_total_budget,
+        target_sample_seed=args.target_sample_seed,
+        legacy_reuse_reference_for_eval=bool(args.legacy_reuse_reference_for_eval),
         reference_datasets=[item.strip() for item in args.reference_datasets.split(",") if item.strip()],
+        eval_only_datasets=[item.strip() for item in args.eval_only_datasets.split(",") if item.strip()],
+        reference_mixtures=parse_reference_mixture_specs(args.reference_mixtures),
         candidate_source=args.candidate_source,
         overwrite=bool(args.overwrite),
     )
@@ -701,6 +910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "candidate_validation_file": "candidate_validation.jsonl",
             "candidate_test_file": "candidate_test.jsonl",
             "reference_prompt_file": "reference_prompts.jsonl",
+            "reference_mixture_dir": "reference_mixtures/",
             "reference_validation_file": "reference_validation.jsonl",
             "reference_test_file": "reference_test.jsonl",
             "reference_eval_dir": "reference_eval/",

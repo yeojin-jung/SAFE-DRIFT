@@ -1036,6 +1036,53 @@ def quadrant_fractions(x: torch.Tensor, y: torch.Tensor, selected_indices: np.nd
     }
 
 
+def plot_selected_gradient_quadrants(
+    path: Path,
+    reference_alignment: torch.Tensor,
+    residual_alignment: torch.Tensor,
+    selected_indices: np.ndarray,
+) -> None:
+    x = reference_alignment.detach().float().cpu().numpy()
+    y = residual_alignment.detach().float().cpu().numpy()
+    selected = np.asarray(selected_indices, dtype=np.int64)
+
+    fig, ax = plt.subplots(figsize=(7.4, 6.2), constrained_layout=True)
+    ax.scatter(
+        x,
+        y,
+        s=10,
+        color="#A9ADB3",
+        alpha=0.28,
+        linewidths=0,
+        rasterized=True,
+        label="candidate pool",
+    )
+    if selected.size:
+        ax.scatter(
+            x[selected],
+            y[selected],
+            s=18,
+            color="#B3212D",
+            alpha=0.72,
+            linewidths=0,
+            rasterized=True,
+            label=f"selected (n={selected.size})",
+        )
+    ax.axhline(0.0, color="#20252B", linewidth=0.9)
+    ax.axvline(0.0, color="#20252B", linewidth=0.9)
+    ax.set_xlabel(r"Reference-subspace target alignment $d_i^R$")
+    ax.set_ylabel(r"Residual target alignment $d_i^T$")
+    ax.set_title("Selected gradients in the target-reference quadrants")
+    ax.text(0.02, 0.98, r"$Q_{\mathrm{clean}}$", transform=ax.transAxes, va="top")
+    ax.text(0.98, 0.98, r"$Q_{\mathrm{ent}}$", transform=ax.transAxes, ha="right", va="top")
+    ax.text(0.02, 0.02, r"$Q_{\mathrm{mis}}$", transform=ax.transAxes, va="bottom")
+    ax.text(0.98, 0.02, r"$Q_{\mathrm{ref}}$", transform=ax.transAxes, ha="right", va="bottom")
+    ax.grid(True, linewidth=0.35, alpha=0.25)
+    ax.legend(frameon=False, loc="best")
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+
+
 def pca_block_energy_summary(candidates: torch.Tensor, k_r: int, n_components: int = 16) -> dict[str, Any]:
     if candidates.shape[0] < 2 or candidates.shape[1] < 2:
         return {"components": []}
@@ -1226,6 +1273,14 @@ def analyze_entanglement(
     _write_csv(selected_csv_path, rows)
     if rows:
         summary["selected_subset_metrics_csv"] = str(selected_csv_path)
+    selected_quadrant_plot = output_dir / "selected_gradient_quadrants.png"
+    plot_selected_gradient_quadrants(
+        selected_quadrant_plot,
+        damped_r,
+        damped_t,
+        selected,
+    )
+    summary["selected_gradient_quadrants_plot"] = str(selected_quadrant_plot)
 
     summary_path = output_dir / "entanglement_summary.json"
     summary_path.write_text(json.dumps(_json_safe(summary), indent=2, ensure_ascii=False), encoding="utf-8")

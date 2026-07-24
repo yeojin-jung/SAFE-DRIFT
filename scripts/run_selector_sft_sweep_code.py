@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import fcntl
 import gc
 import hashlib
@@ -49,8 +50,13 @@ from utils.extract_gradients import (
     load_model_with_lora,
     project_preconditioner_count_sketch,
 )
+from utils.adam_selection import planned_learning_rate_sum
 from utils.low_rank_fisher_builder import compute_low_rank_safe_inputs_from_examples
 from utils.preconditioner import build_adam_preconditioner, estimate_adam_second_moment
+from utils.safe_budget_calibration import (
+    coupled_reference_budget,
+    random_subset_update_norm_calibration,
+)
 from safe_drift.safe_drift_selector import select_safe_subset_from_gradients
 from utils.data_construction import (
     load_records,
@@ -72,6 +78,27 @@ DEFAULT_REFERENCE_FILE = REPO_ROOT / "data" / "references" / "stereoset_referenc
 
 def safe_slug(value: str) -> str:
     return "".join(char if char.isalnum() or char in "._-" else "_" for char in value).strip("_") or "value"
+
+
+def parse_extra_eval_spec(spec: str) -> dict[str, str]:
+    try:
+        name, rest = str(spec).split("=", 1)
+        evaluator, path = rest.split(":", 1)
+    except ValueError as exc:
+        raise ValueError(
+            "Extra eval specs must use NAME=EVALUATOR:/path/to/file.jsonl syntax; "
+            f"got {spec!r}."
+        ) from exc
+    name = safe_slug(name)
+    evaluator = evaluator.strip()
+    path = path.strip()
+    if not name or not evaluator or not path:
+        raise ValueError(f"Invalid extra eval spec: {spec!r}")
+    return {"name": name, "evaluator": evaluator, "file": path}
+
+
+def parse_extra_eval_specs(specs: list[str] | tuple[str, ...] | None) -> list[dict[str, str]]:
+    return [parse_extra_eval_spec(spec) for spec in (specs or [])]
 
 
 def parse_auto_float(value: str) -> float | None:
@@ -106,6 +133,17 @@ def write_jsonl(records: list[dict[str, Any]], path: Path) -> None:
 def write_json(records: list[dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def write_csv(records: list[dict[str, Any]], path: Path) -> None:
+    if not records:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = sorted({key for record in records for key in record})
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
 
 
 def write_instruction_jsonl(records: list[dict[str, Any]], path: Path) -> None:
@@ -147,37 +185,68 @@ def split_lookup(
 def prepare_candidate_pools(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """Prepare candidate data and optional Adam warmup examples.
 
-    The selector candidate pool is intentionally stable across Adam/SGD and
-    SAFE hyperparameters so all variants can reuse the same cached gradient
-    features. Adam still estimates its preconditioner on a deterministic
-    warmup subset, but that subset no longer changes the selection pool.
+    The default selector pool is stable across Adam/SGD and SAFE
+    hyperparameters. Legacy reproduction mode restores the original behavior:
+    remove the deterministic warmup holdout, then subsample the selection pool.
     """
+    legacy_disjoint = bool(args.legacy_disjoint_preconditioner_pool)
     split_info: dict[str, Any] = {
-        "preconditioner_data_disjoint": False,
+        "preconditioner_data_disjoint": legacy_disjoint,
         "preconditioner_candidate_count": 0,
         "selection_candidate_count": len(candidates),
         "preconditioner_candidate_file": None,
         "selection_candidate_file": str(Path(args.candidate_file).resolve()),
         "preconditioner_split_seed": None,
+        "legacy_disjoint_preconditioner_pool": legacy_disjoint,
+        "selection_candidate_max_examples": args.selection_candidate_max_examples,
+        "selection_candidate_subsample_seed": args.selection_candidate_subsample_seed,
     }
-    if args.selector_preconditioner != "adam":
+    if (
+        args.selector_preconditioner != "adam"
+        and not legacy_disjoint
+        and args.selection_candidate_max_examples is None
+    ):
         setattr(args, "_preconditioner_candidates", candidates)
         return candidates, candidates, split_info
 
-    if len(candidates) < 2:
-        raise ValueError("Need at least 2 candidates to sample Adam preconditioner warmup data.")
+    if args.selector_preconditioner == "adam" or legacy_disjoint:
+        if len(candidates) < 2:
+            raise ValueError("Need at least 2 candidates to sample preconditioner warmup data.")
+        holdout_size = max(1, math.ceil(len(candidates) * float(args.adam_warmup_steps)))
+        holdout_size = min(holdout_size, len(candidates) - 1)
+        indices = list(range(len(candidates)))
+        random.Random(int(args.preconditioner_split_seed)).shuffle(indices)
+        preconditioner_ids = set(indices[:holdout_size])
+        preconditioner_candidates = [record for idx, record in enumerate(candidates) if idx in preconditioner_ids]
+        selection_candidates = (
+            [record for idx, record in enumerate(candidates) if idx not in preconditioner_ids]
+            if legacy_disjoint
+            else list(candidates)
+        )
+    else:
+        preconditioner_candidates = list(candidates)
+        selection_candidates = list(candidates)
 
-    holdout_size = max(1, math.ceil(len(candidates) * float(args.adam_warmup_steps)))
-    holdout_size = min(holdout_size, len(candidates) - 1)
-    indices = list(range(len(candidates)))
-    random.Random(int(args.preconditioner_split_seed)).shuffle(indices)
-    preconditioner_ids = set(indices[:holdout_size])
-    preconditioner_candidates = [record for idx, record in enumerate(candidates) if idx in preconditioner_ids]
-    selection_candidates = list(candidates)
+    if args.selection_candidate_max_examples is not None:
+        max_examples = int(args.selection_candidate_max_examples)
+        if max_examples <= 0:
+            raise ValueError("--selection-candidate-max-examples must be positive.")
+        if len(selection_candidates) > max_examples:
+            subsample_seed = (
+                int(args.selection_candidate_subsample_seed)
+                if args.selection_candidate_subsample_seed is not None
+                else int(args.seed)
+            )
+            indices = list(range(len(selection_candidates)))
+            random.Random(subsample_seed).shuffle(indices)
+            selection_candidates = [selection_candidates[index] for index in indices[:max_examples]]
 
     pool_dir = Path(args.feature_cache_dir).resolve().parent / "candidate_pools"
     preconditioner_file = pool_dir / "preconditioner_warmup_candidates.jsonl"
-    selection_file = pool_dir / "selection_candidates_full_pool.jsonl"
+    materialized_selection = legacy_disjoint or args.selection_candidate_max_examples is not None
+    selection_file = pool_dir / (
+        "selection_candidates.jsonl" if materialized_selection else "selection_candidates_full_pool.jsonl"
+    )
     if args.overwrite_selection_cache or not preconditioner_file.exists():
         write_jsonl(preconditioner_candidates, preconditioner_file)
     if args.overwrite_selection_cache or not selection_file.exists():
@@ -185,18 +254,21 @@ def prepare_candidate_pools(args: argparse.Namespace, candidates: list[dict[str,
 
     setattr(args, "_preconditioner_candidates", preconditioner_candidates)
     setattr(args, "_preconditioner_candidate_file", str(preconditioner_file))
-    setattr(args, "_selection_candidate_file", str(Path(args.candidate_file).resolve()))
+    setattr(
+        args,
+        "_selection_candidate_file",
+        str(selection_file) if materialized_selection else str(Path(args.candidate_file).resolve()),
+    )
     setattr(args, "_selection_candidate_inspection_file", str(selection_file))
 
     split_info.update(
         {
-            "preconditioner_data_disjoint": False,
             "preconditioner_candidate_count": len(preconditioner_candidates),
             "selection_candidate_count": len(selection_candidates),
             "preconditioner_candidate_file": str(preconditioner_file.resolve()),
             "selection_candidate_file": str(selection_file.resolve()),
             "preconditioner_split_seed": int(args.preconditioner_split_seed),
-            "preconditioner_warmup_excluded_from_selection": False,
+            "preconditioner_warmup_excluded_from_selection": legacy_disjoint,
         }
     )
     return preconditioner_candidates, selection_candidates, split_info
@@ -361,6 +433,7 @@ class SharedSelectorFeatures:
     target_feature: torch.Tensor
     target_features: torch.Tensor | None
     reference_fisher: torch.Tensor | None
+    basis: torch.Tensor | None
     selector_preconditioner: torch.Tensor | None
     info: dict[str, Any]
 
@@ -375,6 +448,8 @@ def selector_feature_descriptor(args: argparse.Namespace) -> dict[str, Any]:
         "candidate": candidate_cache_tag(args),
         "target": target_cache_tag(args),
         "reference": reference_tag,
+        "reference_composition_name": args.reference_composition_name,
+        "reference_composition_domains": list(args.reference_composition_domains or []),
         "selector_feature_method": args.selector_feature_method,
         "reference_max_examples": int(args.reference_fisher_max_examples),
         "K_R": args.low_rank_reference_rank,
@@ -391,7 +466,17 @@ def selector_feature_descriptor(args: argparse.Namespace) -> dict[str, Any]:
         "target_max_examples": args.low_rank_target_max_examples,
         "candidate_max_examples": args.low_rank_candidate_max_examples,
         "candidate_subset_seed": args.seed,
+        "adam_selection_mode": args.adam_selection_mode,
     }
+    if adam_preconditions_before_projection(args):
+        descriptor.update(
+            {
+                "adam_preconditioner_candidate": preconditioner_data_cache_tag(args),
+                "adam_beta2": args.adam_beta2,
+                "adam_eps": args.adam_eps,
+                "adam_warmup_steps": args.adam_warmup_steps,
+            }
+        )
     if args.selector_feature_method == "random_sketch":
         descriptor.update(
             {
@@ -428,6 +513,8 @@ def selector_feature_cache_path(args: argparse.Namespace) -> Path:
                 f"builderalpha{optional_rank_tag(float(args.low_rank_builder_alpha))}",
             ]
         )
+        if adam_preconditions_before_projection(args):
+            parts.append("adam_precondition_before_projection")
     parts.append(f"refmax{args.reference_fisher_max_examples}")
     parts.extend(
         [
@@ -441,10 +528,12 @@ def selector_feature_cache_path(args: argparse.Namespace) -> Path:
 def write_shared_feature_artifacts(
     args: argparse.Namespace,
     cache_path: Path,
+    candidate_records: list[dict[str, Any]],
     candidate_features: torch.Tensor,
     target_feature: torch.Tensor,
     target_features: torch.Tensor | None,
     reference_fisher: torch.Tensor | None,
+    basis: torch.Tensor | None,
     metadata: dict[str, Any],
     reference_evals_full: torch.Tensor | None = None,
     task_evals_full: torch.Tensor | None = None,
@@ -461,6 +550,7 @@ def write_shared_feature_artifacts(
 
     stem = cache_path.stem
     torch.save(candidate_features.cpu(), features_dir / f"{stem}_candidate_features.pt")
+    torch.save(candidate_features.cpu(), features_dir / f"{stem}_projected_candidate_gradients.pt")
     torch.save(target_feature.cpu(), features_dir / f"{stem}_target_feature.pt")
     if target_features is not None:
         torch.save(target_features.cpu(), features_dir / f"{stem}_target_features.pt")
@@ -470,8 +560,38 @@ def write_shared_feature_artifacts(
         torch.save(reference_evals_full.cpu(), spectra_dir / f"{stem}_reference_evals_full.pt")
     if task_evals_full is not None:
         torch.save(task_evals_full.cpu(), spectra_dir / f"{stem}_task_evals_full.pt")
+    row_records = []
+    for candidate_row, record in enumerate(candidate_records):
+        row_records.append(
+            {
+                "candidate_row": candidate_row,
+                "id": record.get("id"),
+                "source": record.get("source"),
+                "task": record.get("task"),
+                "text_hash": record.get("text_hash"),
+            }
+        )
+    row_map_path = metadata_dir / f"{stem}_candidate_gradient_rows.jsonl"
+    write_jsonl(row_records, row_map_path)
+    ordered_ids = "\n".join(str(row.get("id") or row["candidate_row"]) for row in row_records)
+    artifact_metadata = {
+        **metadata,
+        "gradient_representation": "low_rank_projected_coordinates"
+        if args.selector_feature_method == "low_rank"
+        else "count_sketch_projected_coordinates",
+        "gradient_representation_is_preconditioned_update": bool(
+            adam_preconditions_before_projection(args)
+        ),
+        "projected_candidate_gradients_file": str(
+            (features_dir / f"{stem}_projected_candidate_gradients.pt").resolve()
+        ),
+        "candidate_gradient_row_map_file": str(row_map_path.resolve()),
+        "candidate_gradient_row_map_sha256": hashlib.sha256(ordered_ids.encode("utf-8")).hexdigest(),
+        "projection_basis_embedded_in_cache": bool(basis is not None),
+        "projection_basis_cache_file": str(cache_path.resolve()) if basis is not None else None,
+    }
     (metadata_dir / f"{stem}_metadata.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False),
+        json.dumps(artifact_metadata, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -481,6 +601,49 @@ def resolved_adam_warmup_steps(args: argparse.Namespace, candidates: list[dict[s
     if getattr(args, "separate_preconditioner_data", True):
         return len(warmup_data)
     return max(1, math.ceil(len(candidates) * float(args.adam_warmup_steps)))
+
+
+def adam_preconditions_before_projection(args: argparse.Namespace) -> bool:
+    return (
+        args.selector_preconditioner == "adam"
+        and args.adam_selection_mode == "precondition_before_projection"
+    )
+
+
+def selector_preconditioner_tag(args: argparse.Namespace) -> str:
+    if adam_preconditions_before_projection(args):
+        return "adam_precondition_before_projection"
+    return str(args.selector_preconditioner)
+
+
+def selector_learning_rate(
+    args: argparse.Namespace,
+    subset_budget: int,
+) -> tuple[float, dict[str, Any]]:
+    if not adam_preconditions_before_projection(args):
+        return float(args.safe_learning_rate), {
+            "selector_learning_rate": float(args.safe_learning_rate),
+            "selector_learning_rate_source": "safe_learning_rate",
+        }
+    if args.adam_selection_effective_learning_rate is not None:
+        value = float(args.adam_selection_effective_learning_rate)
+        if value <= 0.0:
+            raise ValueError("--adam-selection-effective-learning-rate must be positive.")
+        return value, {
+            "selector_learning_rate": value,
+            "selector_learning_rate_source": "explicit_adam_selection_effective_learning_rate",
+        }
+    value, metadata = planned_learning_rate_sum(args, subset_budget)
+    if value <= 0.0:
+        raise ValueError(
+            "The planned learning-rate schedule has zero total scale. "
+            "Set --adam-selection-effective-learning-rate explicitly."
+        )
+    return value, {
+        **metadata,
+        "selector_learning_rate": value,
+        "selector_learning_rate_source": "planned_training_schedule_sum",
+    }
 
 
 def selector_preconditioner_cache_path(args: argparse.Namespace, warmup_steps: int) -> Path:
@@ -787,6 +950,11 @@ def compute_random_sketch_selector_features(
         "reference_fisher_wallclock_seconds": fisher_seconds,
         "reference_fisher_available": reference_fisher is not None,
         "low_rank_features_are_preconditioned": False,
+        "reference_composition_name": args.reference_composition_name,
+        "reference_composition_domains": list(args.reference_composition_domains or []),
+        "reference_fisher_weighted": any(
+            record.get("reference_fisher_weight") is not None for record in references
+        ),
     }, None, None, None
 
 
@@ -798,6 +966,7 @@ def compute_low_rank_selector_features(
     model,
     tokenizer,
     device: torch.device,
+    update_preconditioner: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, dict[str, Any], torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     if not references:
         raise ValueError("--selector-feature-method low_rank requires reference samples.")
@@ -860,6 +1029,7 @@ def compute_low_rank_selector_features(
         include_basis=False,
         save_target_features=bool(getattr(args, "save_all_target_features", False)),
         candidate_projection_chunk_rows=int(args.low_rank_candidate_projection_chunk_rows),
+        update_preconditioner=update_preconditioner,
     )
     candidate_features = safe_inputs.candidate_features.cpu()
     target_feature = safe_inputs.target_feature.cpu()
@@ -892,9 +1062,15 @@ def compute_low_rank_selector_features(
             None if safe_inputs.task_candidate_low_rank is None else safe_inputs.task_candidate_low_rank.K_T
         ),
         "reference_fisher_available": True,
-        "low_rank_features_are_preconditioned": False,
+        "low_rank_features_are_preconditioned": bool(update_preconditioner is not None),
+        "low_rank_task_basis_uses_preconditioned_updates": bool(update_preconditioner is not None),
         "save_all_target_features": bool(getattr(args, "save_all_target_features", False)),
         "target_features_shape": None if target_features is None else tuple(target_features.shape),
+        "reference_composition_name": args.reference_composition_name,
+        "reference_composition_domains": list(args.reference_composition_domains or []),
+        "reference_fisher_weighted": any(
+            record.get("reference_fisher_weight") is not None for record in references
+        ),
     }
     basis = safe_inputs.common_basis.U_K.cpu()
     reference_evals_full = safe_inputs.reference_low_rank.evals_full.cpu()
@@ -920,6 +1096,11 @@ def compute_or_load_shared_selector_features(
     targets: list[dict[str, Any]],
     references: list[dict[str, Any]],
 ) -> SharedSelectorFeatures:
+    if adam_preconditions_before_projection(args) and args.selector_feature_method != "low_rank":
+        raise ValueError(
+            "--adam-selection-mode precondition_before_projection currently requires "
+            "--selector-feature-method low_rank."
+        )
     cache_path = selector_feature_cache_path(args)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[selector features] requested cache path: {cache_path}")
@@ -934,7 +1115,7 @@ def compute_or_load_shared_selector_features(
             "selector_feature_wallclock_seconds": 0.0,
         }
         selector_preconditioner = None
-        if args.selector_preconditioner == "adam":
+        if args.selector_preconditioner == "adam" and not adam_preconditions_before_projection(args):
             basis = payload.get("basis")
             warmup_steps = resolved_adam_warmup_steps(args, candidates)
             preconditioner_cache = selector_preconditioner_cache_path(args, warmup_steps)
@@ -970,6 +1151,7 @@ def compute_or_load_shared_selector_features(
             target_feature=payload["target_feature"],
             target_features=payload.get("target_features"),
             reference_fisher=payload.get("reference_fisher"),
+            basis=payload.get("basis"),
             selector_preconditioner=selector_preconditioner,
             info=info,
         )
@@ -999,20 +1181,48 @@ def compute_or_load_shared_selector_features(
             model=model,
             tokenizer=tokenizer,
             device=device,
+            update_preconditioner=preconditioner if adam_preconditions_before_projection(args) else None,
         )
     else:
         raise ValueError(f"Unsupported selector feature method: {args.selector_feature_method}")
 
-    projected_preconditioner = save_projected_preconditioner(
-        selector_feature_method=args.selector_feature_method,
-        selector_feature_cache_path=cache_path,
-        preconditioner_info=preconditioner_info,
-        full_preconditioner=preconditioner,
-        basis=basis,
-        projection_dim=args.selector_projection_dim if args.selector_feature_method == "random_sketch" else None,
-        projection_seed=args.selector_projection_seed if args.selector_feature_method == "random_sketch" else None,
-    )
+    projected_preconditioner = None
+    if not adam_preconditions_before_projection(args):
+        projected_preconditioner = save_projected_preconditioner(
+            selector_feature_method=args.selector_feature_method,
+            selector_feature_cache_path=cache_path,
+            preconditioner_info=preconditioner_info,
+            full_preconditioner=preconditioner,
+            basis=basis,
+            projection_dim=args.selector_projection_dim if args.selector_feature_method == "random_sketch" else None,
+            projection_seed=args.selector_projection_seed if args.selector_feature_method == "random_sketch" else None,
+        )
 
+    model_parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    reference_gradient_count = min(len(references), int(args.reference_fisher_max_examples))
+    target_gradient_count = min(
+        len(targets),
+        len(targets)
+        if args.low_rank_target_max_examples is None
+        else int(args.low_rank_target_max_examples),
+    )
+    candidate_gradient_count = len(candidates)
+    preconditioner_gradient_count = (
+        resolved_adam_warmup_steps(args, candidates)
+        if args.selector_preconditioner == "adam"
+        else 0
+    )
+    estimated_selection_flops = (
+        6.0
+        * float(model_parameter_count)
+        * float(args.max_seq_len)
+        * float(
+            reference_gradient_count
+            + target_gradient_count
+            + candidate_gradient_count
+            + preconditioner_gradient_count
+        )
+    )
     feature_metadata = {
         **selector_feature_descriptor(args),
         **feature_info,
@@ -1021,6 +1231,17 @@ def compute_or_load_shared_selector_features(
         "target_feature_shape": tuple(target_feature.shape),
         "target_features_shape": None if target_features is None else tuple(target_features.shape),
         "reference_fisher_shape": None if reference_fisher is None else tuple(reference_fisher.shape),
+        "estimated_selection_flops": estimated_selection_flops,
+        "estimated_selection_flops_method": (
+            "6x_parameter_token_upper_bound_over_reference_target_candidate_and_adam_warmup_gradients"
+        ),
+        "selection_model_parameter_count": int(model_parameter_count),
+        "selection_gradient_example_count": int(
+            reference_gradient_count
+            + target_gradient_count
+            + candidate_gradient_count
+            + preconditioner_gradient_count
+        ),
     }
     metadata = {
         **feature_metadata,
@@ -1042,26 +1263,37 @@ def compute_or_load_shared_selector_features(
             "target_features": None if target_features is None else target_features.cpu(),
             "reference_fisher": None if reference_fisher is None else reference_fisher.cpu(),
             "basis": None if basis is None else basis.cpu(),
-            "metadata": feature_metadata,
+            "metadata": metadata,
         },
         cache_path,
     )
     write_shared_feature_artifacts(
         args=args,
         cache_path=cache_path,
+        candidate_records=candidates,
         candidate_features=candidate_features,
         target_feature=target_feature,
         target_features=target_features,
         reference_fisher=reference_fisher,
+        basis=basis,
         metadata=metadata,
         reference_evals_full=reference_evals_full,
         task_evals_full=task_evals_full,
     )
+    # Training runs in a subprocess and loads its own model. Release the
+    # selection model first so both copies never occupy the same GPU.
+    del model
+    del preconditioner
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("[selector features] released selection model before training")
     return SharedSelectorFeatures(
         candidate_features=candidate_features.cpu(),
         target_feature=target_feature.cpu(),
         target_features=None if target_features is None else target_features.cpu(),
         reference_fisher=None if reference_fisher is None else reference_fisher.cpu(),
+        basis=None if basis is None else basis.cpu(),
         selector_preconditioner=projected_preconditioner,
         info=metadata,
     )
@@ -1092,6 +1324,7 @@ def get_shared_selector_features(
             target_feature=features.target_feature,
             target_features=features.target_features,
             reference_fisher=features.reference_fisher,
+            basis=features.basis,
             selector_preconditioner=features.selector_preconditioner,
             info=info,
         )
@@ -1194,6 +1427,8 @@ def collect_entanglement_analysis_results(args: argparse.Namespace) -> list[dict
 def selector_update_preconditioner(args: argparse.Namespace, features: SharedSelectorFeatures) -> torch.Tensor | None:
     if args.selector_preconditioner != "adam":
         return None
+    if adam_preconditions_before_projection(args):
+        return None
     if features.selector_preconditioner is None:
         raise ValueError(
             "selector_preconditioner=adam requires a projected preconditioner. "
@@ -1224,11 +1459,52 @@ def load_model_for_selection(args: argparse.Namespace, device: torch.device):
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
         device=device,
+        torch_dtype=args.selection_torch_dtype or args.train_torch_dtype,
     )
 
 
 def build_subset_records(candidates: list[dict[str, Any]], indices: list[int]) -> list[dict[str, Any]]:
     return [candidates[int(index)] for index in indices]
+
+
+def build_weighted_safe_records(
+    *,
+    candidates: list[dict[str, Any]],
+    indices: list[int],
+    weights: list[float],
+    subset_budget: int,
+    average_by_budget: bool,
+    solver: str,
+) -> list[dict[str, Any]]:
+    if len(indices) != len(weights):
+        raise ValueError("SAFE selection indices and weights must have the same length.")
+    support_size = len(indices)
+    if support_size == 0:
+        if not candidates:
+            raise ValueError("Cannot materialize a no-op SAFE run from an empty candidate pool.")
+        sentinel = dict(candidates[0])
+        sentinel["safe_selection_weight"] = 0.0
+        sentinel["safe_training_weight"] = 0.0
+        sentinel["safe_selection_solver"] = str(solver)
+        sentinel["safe_noop_sentinel"] = True
+        return [sentinel]
+
+    # DataLoader training averages over the materialized support. Rescale each
+    # loss so that the average gradient matches the selector's fixed 1 / S
+    # dictionary normalization (or its unnormalized sum variant).
+    training_scale = (
+        float(support_size) / float(subset_budget)
+        if average_by_budget
+        else float(support_size)
+    )
+    records: list[dict[str, Any]] = []
+    for index, weight in zip(indices, weights, strict=True):
+        record = dict(candidates[int(index)])
+        record["safe_selection_weight"] = float(weight)
+        record["safe_training_weight"] = float(weight) * training_scale
+        record["safe_selection_solver"] = str(solver)
+        records.append(record)
+    return records
 
 
 def write_tensor_if_present(tensor: torch.Tensor | None, path: Path) -> str | None:
@@ -1339,6 +1615,111 @@ def safe_constraint_report(
     }
 
 
+def unconstrained_target_reference_cost(
+    target_feature: torch.Tensor,
+    reference_fisher: torch.Tensor,
+    epsilon: float,
+) -> float:
+    target = target_feature.detach().float()
+    fisher = reference_fisher.detach().float()
+    norm_sq = float(torch.dot(target, target).item())
+    if norm_sq <= 0.0:
+        raise ValueError("Cannot derive beta-normalized SAFE rho from a zero target gradient.")
+    fisher_quadratic = float(torch.dot(target, fisher * target).item())
+    return 0.5 * float(epsilon) * float(epsilon) * fisher_quadratic / norm_sq
+
+
+def resolve_safe_epsilon(
+    args: argparse.Namespace,
+    features: SharedSelectorFeatures,
+    *,
+    subset_budget: int,
+    learning_rate: float,
+) -> tuple[float | None, dict[str, Any]]:
+    if args.safe_epsilon is not None and args.safe_epsilon_multiplier is not None:
+        raise ValueError("Use either --safe-epsilon or --safe-epsilon-multiplier, not both.")
+    if args.safe_epsilon_multiplier is None:
+        return args.safe_epsilon, {
+            "safe_configured_epsilon": args.safe_epsilon,
+            "safe_epsilon_multiplier": None,
+            "safe_epsilon_calibration_base": None,
+        }
+
+    calibration_seed = (
+        int(args.safe_epsilon_calibration_seed)
+        if args.safe_epsilon_calibration_seed is not None
+        else int(args.seed)
+    )
+    epsilon0, calibration_info = random_subset_update_norm_calibration(
+        features.candidate_features,
+        subset_budget=subset_budget,
+        learning_rate=learning_rate,
+        preconditioner=selector_update_preconditioner(args, features),
+        sample_count=int(args.safe_epsilon_calibration_samples),
+        seed=calibration_seed,
+    )
+    multiplier = float(args.safe_epsilon_multiplier)
+    if multiplier <= 0.0:
+        raise ValueError("--safe-epsilon-multiplier must be positive.")
+    resolved_epsilon = multiplier * epsilon0
+    return resolved_epsilon, {
+        "safe_configured_epsilon": None,
+        "safe_epsilon_multiplier": multiplier,
+        "safe_epsilon_calibration_base": epsilon0,
+        **calibration_info,
+    }
+
+
+def resolve_safe_reference_budget(
+    args: argparse.Namespace,
+    features: SharedSelectorFeatures,
+    *,
+    epsilon: float | None,
+) -> tuple[float | None, dict[str, Any]]:
+    configured = [
+        args.safe_cost_c is not None,
+        args.safe_cost_beta is not None,
+        args.safe_cost_gamma is not None,
+    ]
+    if sum(configured) > 1:
+        raise ValueError(
+            "Use exactly one of --safe-cost-c, --safe-cost-beta, or "
+            "--safe-cost-gamma."
+        )
+    if args.safe_cost_beta is None and args.safe_cost_gamma is None:
+        return args.safe_cost_c, {
+            "safe_cost_beta": None,
+            "safe_cost_gamma": None,
+            "safe_unconstrained_target_reference_cost": None,
+            "safe_effective_cost_c": args.safe_cost_c,
+        }
+    if epsilon is None:
+        raise ValueError("Gamma/beta-normalized SAFE rho requires an epsilon budget.")
+    if features.reference_fisher is None:
+        raise ValueError("Gamma/beta-normalized SAFE rho requires a reference Fisher.")
+    gamma = (
+        float(args.safe_cost_gamma)
+        if args.safe_cost_gamma is not None
+        else float(args.safe_cost_beta)
+    )
+    effective_cost_c, coupled_info = coupled_reference_budget(
+        target_gradient=features.target_feature,
+        reference_fisher=features.reference_fisher,
+        epsilon=float(epsilon),
+        gamma=gamma,
+        preconditioner=selector_update_preconditioner(args, features),
+    )
+    return effective_cost_c, {
+        "safe_cost_beta": (
+            None if args.safe_cost_beta is None else float(args.safe_cost_beta)
+        ),
+        "safe_unconstrained_target_reference_cost": (
+            0.5 * coupled_info["safe_reference_curvature_q0"] * float(epsilon) ** 2
+        ),
+        **coupled_info,
+    }
+
+
 def ensure_random_subset(
     args: argparse.Namespace,
     candidates: list[dict[str, Any]],
@@ -1397,7 +1778,7 @@ def ensure_less_subset(
     references: list[dict[str, Any]],
     subset_budget: int,
 ) -> tuple[Path, dict[str, Any]]:
-    selector_name = f"less_{args.selector_feature_method}_{args.selector_preconditioner}"
+    selector_name = f"less_{args.selector_feature_method}_{selector_preconditioner_tag(args)}"
     output_path = subset_output_path(args, selector_name, subset_budget)
     if output_path.exists() and not args.overwrite_subsets:
         return output_path, {"selector": selector_name, "cache_hit": True, "selection_wallclock_seconds": 0.0}
@@ -1429,7 +1810,7 @@ def ensure_prismatic_subset(
     references: list[dict[str, Any]],
     subset_budget: int,
 ) -> tuple[Path, dict[str, Any]]:
-    selector_name = f"prismatic_{args.selector_feature_method}_{args.selector_preconditioner}"
+    selector_name = f"prismatic_{args.selector_feature_method}_{selector_preconditioner_tag(args)}"
     output_path = subset_output_path(args, selector_name, subset_budget)
     if output_path.exists() and not args.overwrite_subsets:
         return output_path, {"selector": selector_name, "cache_hit": True, "selection_wallclock_seconds": 0.0}
@@ -1463,13 +1844,67 @@ def ensure_safe_subset(
     references: list[dict[str, Any]],
     subset_budget: int,
 ) -> tuple[Path, dict[str, Any]]:
-    selector_tag = f"safe_{args.selector_feature_method}_{args.selector_preconditioner}_{args.safe_geometry}_{args.safe_solver}"
-    if args.safe_alpha is None:
-        if args.safe_cost_c is None or args.safe_epsilon is None:
-            raise ValueError("--safe-alpha auto requires --safe-cost-c and --safe-epsilon.")
+    effective_learning_rate, learning_rate_info = selector_learning_rate(args, subset_budget)
+    selector_tag = (
+        f"safe_{args.selector_feature_method}_{selector_preconditioner_tag(args)}_"
+        f"{args.safe_geometry}_{args.safe_solver}_"
+        f"eta{safe_slug(f'{effective_learning_rate:.8g}')}"
+    )
+    if args.safe_geometry == "reference":
+        selector_tag = f"{selector_tag}_metricFplusAlpha"
+    if args.safe_solver == "constrained_greedy":
         selector_tag = (
-            f"{selector_tag}_cost{safe_slug(f'{args.safe_cost_c:g}')}_"
-            f"eps{safe_slug(f'{args.safe_epsilon:g}')}"
+            f"{selector_tag}_swaps{int(args.safe_greedy_swap_passes)}_"
+            f"feastol{safe_slug(f'{args.safe_feasibility_tolerance:g}')}"
+        )
+    elif args.safe_solver == "relaxed":
+        selector_tag = (
+            f"{selector_tag}_{safe_slug(args.safe_relaxed_cvx_solver.lower())}_"
+            f"wthresh{safe_slug(f'{args.safe_relaxed_weight_threshold:g}')}"
+        )
+    if args.safe_alpha is None:
+        if (
+            args.safe_epsilon is None
+            and args.safe_epsilon_multiplier is None
+        ) or (
+            args.safe_cost_c is None
+            and args.safe_cost_beta is None
+            and args.safe_cost_gamma is None
+        ):
+            raise ValueError(
+                "--safe-alpha auto requires an epsilon or epsilon multiplier and "
+                "one of --safe-cost-c, --safe-cost-beta, or --safe-cost-gamma."
+            )
+        if sum(
+            value is not None
+            for value in (
+                args.safe_cost_c,
+                args.safe_cost_beta,
+                args.safe_cost_gamma,
+            )
+        ) > 1:
+            raise ValueError(
+                "Use exactly one of --safe-cost-c, --safe-cost-beta, or "
+                "--safe-cost-gamma."
+            )
+        if args.safe_cost_gamma is not None:
+            cost_tag = f"gamma{safe_slug(f'{args.safe_cost_gamma:g}')}"
+        elif args.safe_cost_beta is not None:
+            cost_tag = f"beta{safe_slug(f'{args.safe_cost_beta:g}')}"
+        else:
+            cost_tag = f"cost{safe_slug(f'{args.safe_cost_c:g}')}"
+        epsilon_tag = (
+            (
+                f"epsm{safe_slug(f'{args.safe_epsilon_multiplier:g}')}_"
+                f"caln{int(args.safe_epsilon_calibration_samples)}_"
+                f"calseed{int(args.safe_epsilon_calibration_seed if args.safe_epsilon_calibration_seed is not None else args.seed)}"
+            )
+            if args.safe_epsilon_multiplier is not None
+            else f"eps{safe_slug(f'{args.safe_epsilon:g}')}"
+        )
+        selector_tag = (
+            f"{selector_tag}_{cost_tag}_"
+            f"{epsilon_tag}"
         )
     output_path = subset_output_path(args, selector_tag, subset_budget)
     metadata_path = selection_metadata_path(output_path)
@@ -1485,6 +1920,17 @@ def ensure_safe_subset(
     features = get_shared_selector_features(args, candidates, targets, references)
     if features.reference_fisher is None:
         raise ValueError("safe selector requires reference_fisher in the shared selector feature cache.")
+    resolved_epsilon, epsilon_info = resolve_safe_epsilon(
+        args,
+        features,
+        subset_budget=subset_budget,
+        learning_rate=effective_learning_rate,
+    )
+    effective_cost_c, budget_info = resolve_safe_reference_budget(
+        args,
+        features,
+        epsilon=resolved_epsilon,
+    )
 
     start = time.perf_counter()
     result = select_safe_subset_from_gradients(
@@ -1494,22 +1940,37 @@ def ensure_safe_subset(
         fisher=features.reference_fisher.float(),
         subset_budget=subset_budget,
         alpha=args.safe_alpha,
-        learning_rate=args.safe_learning_rate,
-        cost_c=args.safe_cost_c,
-        epsilon=args.safe_epsilon,
+        learning_rate=effective_learning_rate,
+        cost_c=effective_cost_c,
+        epsilon=resolved_epsilon,
         geometry=args.safe_geometry,
         solver=args.safe_solver,
         shortlist_size=args.safe_shortlist_size,
         average_by_budget=args.safe_average_by_budget,
         preconditioner=selector_update_preconditioner(args, features),
+        feasibility_tolerance=args.safe_feasibility_tolerance,
+        objective_tolerance=args.safe_objective_tolerance,
+        greedy_swap_passes=args.safe_greedy_swap_passes,
+        relaxed_cvx_solver=args.safe_relaxed_cvx_solver,
+        relaxed_weight_threshold=args.safe_relaxed_weight_threshold,
     )
     wallclock = time.perf_counter() - start
+    optimization_trace_path = output_path.with_suffix(output_path.suffix + ".optimization_trace.csv")
     if args.overwrite_subsets or not output_exists:
-        write_jsonl(result.selected_candidates, output_path)
+        weighted_records = build_weighted_safe_records(
+            candidates=candidates,
+            indices=result.selected_indices,
+            weights=result.selection_weights,
+            subset_budget=subset_budget,
+            average_by_budget=result.average_by_budget,
+            solver=result.solver,
+        )
+        write_jsonl(weighted_records, output_path)
+        write_csv(result.optimization_trace, optimization_trace_path)
     constraint_report = safe_constraint_report(
         result=result,
-        rho=args.safe_cost_c,
-        epsilon=args.safe_epsilon,
+        rho=effective_cost_c,
+        epsilon=resolved_epsilon,
     )
     selection_info = {
         "selector": selector_tag,
@@ -1519,13 +1980,30 @@ def ensure_safe_subset(
         "safe_solver": result.solver,
         "safe_average_by_budget": result.average_by_budget,
         "safe_shortlist_size": result.shortlist_size,
+        "safe_selected_count": len(result.selected_indices),
+        "safe_is_noop": not result.selected_indices,
+        "safe_selection_weight_sum": float(sum(result.selection_weights)),
+        "safe_selection_weight_min": (
+            float(min(result.selection_weights)) if result.selection_weights else None
+        ),
+        "safe_selection_weight_max": (
+            float(max(result.selection_weights)) if result.selection_weights else None
+        ),
+        "safe_solver_status": result.solver_status,
+        "safe_optimization_trace": result.optimization_trace,
+        "safe_optimization_trace_file": str(optimization_trace_path.resolve()),
         "safe_objective_value": result.objective_value,
         "safe_reference_cost": result.reference_cost,
         "safe_norm_cost": result.norm_cost,
         "safe_predicted_target_gain": result.predicted_target_gain,
         "safe_alpha": result.alpha,
-        "safe_cost_c": args.safe_cost_c,
-        "safe_epsilon": args.safe_epsilon,
+        "safe_cost_c": effective_cost_c,
+        "safe_configured_cost_c": args.safe_cost_c,
+        "safe_epsilon": resolved_epsilon,
+        "reference_composition_name": args.reference_composition_name,
+        "reference_composition_domains": list(args.reference_composition_domains or []),
+        "adam_selection_mode": args.adam_selection_mode,
+        **learning_rate_info,
         "safe_target_update_reference_cost": result.safe_update.get("reference_cost"),
         "safe_target_update_norm_cost": result.safe_update.get("norm_cost"),
         "safe_alpha_status": result.safe_update.get("alpha_status"),
@@ -1548,6 +2026,8 @@ def ensure_safe_subset(
         "safe_selected_epsilon_budget_active": constraint_report["selected_subset"]["epsilon_norm"]["active"],
         "safe_selected_epsilon_budget_gap": constraint_report["selected_subset"]["epsilon_norm"]["gap"],
         "safe_constraint_report": constraint_report,
+        **epsilon_info,
+        **budget_info,
         **features.info,
     }
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1575,6 +2055,9 @@ def save_selected_artifacts_for_run(
     if selector == "full":
         selected_indices = list(range(len(candidates)))
         selected_records = list(candidates)
+    elif selection_info.get("safe_is_noop"):
+        selected_records = []
+        selected_indices = []
     else:
         selected_records = load_records(train_file)
         selected_indices = selected_indices_from_records(candidates, selected_records)
@@ -1599,6 +2082,24 @@ def save_selected_artifacts_for_run(
         ),
         encoding="utf-8",
     )
+    selected_row_records = [
+        {
+            "selected_rank": selected_rank,
+            "candidate_row": int(candidate_index),
+            "id": candidates[int(candidate_index)].get("id"),
+            "source": candidates[int(candidate_index)].get("source"),
+            "task": candidates[int(candidate_index)].get("task"),
+            "text_hash": candidates[int(candidate_index)].get("text_hash"),
+            "safe_selection_weight": selected_records[selected_rank - 1].get("safe_selection_weight"),
+            "safe_training_weight": selected_records[selected_rank - 1].get("safe_training_weight"),
+        }
+        for selected_rank, candidate_index in enumerate(selected_indices, start=1)
+    ]
+    selected_rows_path = artifact_dir / "selected_candidate_gradient_rows.jsonl"
+    write_jsonl(selected_row_records, selected_rows_path)
+    selected_row_ids = "\n".join(
+        str(row.get("id") or row["candidate_row"]) for row in selected_row_records
+    )
 
     info: dict[str, Any] = {
         "enabled": True,
@@ -1606,6 +2107,10 @@ def save_selected_artifacts_for_run(
         "artifact_dir": str(artifact_dir.resolve()),
         "selected_candidates_file": str(selected_candidates_path.resolve()),
         "selected_candidate_indices_file": str(selected_indices_path.resolve()),
+        "selected_candidate_gradient_row_map_file": str(selected_rows_path.resolve()),
+        "selected_candidate_gradient_row_map_sha256": hashlib.sha256(
+            selected_row_ids.encode("utf-8")
+        ).hexdigest(),
         "selected_count": len(selected_indices),
         "candidate_count": len(candidates),
         "feature_cache_path": selection_info.get("selector_feature_cache_path"),
@@ -1627,6 +2132,13 @@ def save_selected_artifacts_for_run(
                 "selected_candidate_features_file": str(selected_features_path.resolve()),
                 "selected_candidate_gradients_file": str(selected_gradients_path.resolve()),
                 "selected_candidate_features_shape": tuple(selected_features.shape),
+                "gradient_representation": (
+                    "low_rank_preconditioned_update_coordinates"
+                    if adam_preconditions_before_projection(args)
+                    else "low_rank_projected_coordinates"
+                    if args.selector_feature_method == "low_rank"
+                    else "count_sketch_projected_coordinates"
+                ),
                 "target_feature_file": write_tensor_if_present(features.target_feature, artifact_dir / "target_feature.pt"),
                 "target_features_file": write_tensor_if_present(features.target_features, artifact_dir / "target_features.pt"),
                 "reference_fisher_file": write_tensor_if_present(features.reference_fisher, artifact_dir / "reference_fisher.pt"),
@@ -1635,6 +2147,7 @@ def save_selected_artifacts_for_run(
                     artifact_dir / "selector_preconditioner.pt",
                 ),
                 "feature_cache_path": features.info.get("selector_feature_cache_path"),
+                "projection_basis_embedded_in_feature_cache": bool(features.basis is not None),
                 "selector_feature_dim": features.info.get("selector_feature_dim"),
                 "reference_fisher_shape": features.info.get("reference_fisher_shape"),
             }
@@ -1754,7 +2267,133 @@ def merge_selection_artifacts_into_training_summary(
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def build_train_command(args: argparse.Namespace, train_file: str | Path, run_output_dir: Path) -> list[str]:
+def merge_selection_info_into_training_summary(
+    run_output_dir: Path,
+    selection_info: dict[str, Any],
+) -> None:
+    summary_path = run_output_dir / "summary.json"
+    if not summary_path.exists():
+        return
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    summary["selection"] = selection_info
+    selection_flops = selection_info.get("estimated_selection_flops")
+    if selection_flops is not None:
+        summary["estimated_selection_flops"] = float(selection_flops)
+        training_flops = summary.get("estimated_total_flops")
+        if training_flops is not None:
+            summary["estimated_total_flops_including_selection"] = (
+                float(training_flops) + float(selection_flops)
+            )
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def generate_update_trajectory_plot(run_output_dir: Path) -> dict[str, Any]:
+    plot_script = REPO_ROOT / "scripts" / "plot_update_constraint_trajectory.py"
+    mpl_config_dir = run_output_dir / ".matplotlib"
+    mpl_config_dir.mkdir(parents=True, exist_ok=True)
+    environment = dict(os.environ)
+    environment.setdefault("MPLCONFIGDIR", str(mpl_config_dir))
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(plot_script),
+            "--run-dir",
+            str(run_output_dir),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        return {
+            "generated": False,
+            "return_code": int(completed.returncode),
+            "error": completed.stderr.strip() or completed.stdout.strip(),
+        }
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        result = {"stdout": completed.stdout.strip()}
+    return {"generated": True, **result}
+
+
+def merge_update_trajectory_plot_into_summary(
+    run_output_dir: Path,
+    plot_info: dict[str, Any] | None,
+) -> None:
+    if not plot_info:
+        return
+    summary_path = run_output_dir / "summary.json"
+    if not summary_path.exists():
+        return
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["update_constraint_trajectory_plot"] = plot_info
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def merge_base_model_eval_into_training_summary(
+    run_output_dir: Path,
+    base_model_eval: dict[str, Any] | None,
+) -> None:
+    if not base_model_eval:
+        return
+    summary_path = run_output_dir / "summary.json"
+    if not summary_path.exists():
+        return
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    summary["base_model_eval"] = base_model_eval
+    summary.update(
+        {
+            key: value
+            for key, value in base_model_eval.items()
+            if key.startswith("base_") and isinstance(value, (int, float, str, bool))
+        }
+    )
+    for key, value in list(summary.items()):
+        if key.startswith("reference_"):
+            prefix = "reference_"
+            base_prefix = "base_reference_"
+            delta_prefix = "reference_delta_"
+        elif key.startswith("ood_"):
+            prefix = "ood_"
+            base_prefix = "base_ood_"
+            delta_prefix = "ood_delta_"
+        elif key.startswith("target_"):
+            prefix = "target_"
+            base_prefix = "base_target_"
+            delta_prefix = "target_delta_"
+        elif key.startswith("extra_eval_"):
+            prefix = "extra_eval_"
+            base_prefix = "base_extra_eval_"
+            delta_prefix = "extra_eval_delta_"
+        else:
+            continue
+        metric_name = key.removeprefix(prefix)
+        base_key = f"{base_prefix}{metric_name}"
+        if (
+            base_key in summary
+            and isinstance(value, (int, float))
+            and isinstance(summary[base_key], (int, float))
+        ):
+            summary[f"{delta_prefix}{metric_name}"] = float(value) - float(summary[base_key])
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def build_train_command(
+    args: argparse.Namespace,
+    train_file: str | Path,
+    run_output_dir: Path,
+    *,
+    selector: str,
+    selection_info: dict[str, Any],
+) -> list[str]:
     train_script = Path(args.train_script)
     train_lora_target_modules = args.train_lora_target_modules or args.lora_target_modules
     train_model_name = args.train_model_name or args.model_name
@@ -1827,12 +2466,62 @@ def build_train_command(args: argparse.Namespace, train_file: str | Path, run_ou
             str(args.humaneval_temperature),
             "--humaneval-top-p",
             str(args.humaneval_top_p),
-            "--evaluate-base-model",
-            "--evaluate-base-ood",
             "--max-grad-norm",
             str(args.max_grad_norm),
+            "--kl-regularization-lambda",
+            str(args.kl_regularization_lambda),
+            "--kl-reference-max-examples",
+            str(args.kl_reference_max_examples),
+            "--trajectory-eval-steps",
+            str(args.trajectory_eval_steps),
+            "--trajectory-reference-max-examples",
+            str(args.trajectory_reference_max_examples),
+            "--trajectory-target-max-examples",
+            str(args.trajectory_target_max_examples),
+            "--trajectory-generation-eval-steps",
+            str(args.trajectory_generation_eval_steps),
+            "--trajectory-generation-max-examples",
+            str(args.trajectory_generation_max_examples),
+            "--trajectory-target-evaluator",
+            str(args.trajectory_target_evaluator or args.evaluator),
+            "--trajectory-reference-evaluator",
+            str(args.trajectory_reference_evaluator),
+            "--trajectory-generation-max-new-tokens",
+            str(args.trajectory_generation_max_new_tokens),
+            "--selection-method",
+            str(selection_info.get("selector") or selector),
+            "--selection-preconditioner",
+            str(args.selector_preconditioner),
+            "--safe-training-constraint-mode",
+            str(args.safe_training_constraint_mode),
         ]
     )
+    safe_rho_for_training = selection_info.get("safe_effective_cost_c", selection_info.get("safe_cost_c", args.safe_cost_c))
+    if safe_rho_for_training is not None:
+        command.extend(["--safe-rho", str(safe_rho_for_training)])
+    safe_epsilon_for_training = selection_info.get("safe_epsilon", args.safe_epsilon)
+    if safe_epsilon_for_training is not None:
+        command.extend(["--safe-epsilon", str(safe_epsilon_for_training)])
+    if args.safe_training_epsilon_scale_by_steps:
+        command.append("--safe-training-epsilon-scale-by-steps")
+    if selection_info.get("safe_reference_cost") is not None:
+        command.extend(
+            [
+                "--selected-predicted-fisher-cost",
+                str(selection_info["safe_reference_cost"]),
+            ]
+        )
+    if selection_info.get("safe_norm_cost") is not None:
+        command.extend(
+            [
+                "--selected-predicted-norm-cost",
+                str(selection_info["safe_norm_cost"]),
+            ]
+        )
+    if args.ood_generation_max_new_tokens is not None:
+        command.extend(["--ood-generation-max-new-tokens", str(args.ood_generation_max_new_tokens)])
+    if args.reference_generation_max_new_tokens is not None:
+        command.extend(["--reference-generation-max-new-tokens", str(args.reference_generation_max_new_tokens)])
     if args.validation_file is None:
         command.extend(
             [
@@ -1867,8 +2556,23 @@ def build_train_command(args: argparse.Namespace, train_file: str | Path, run_ou
         command.extend(["--reference-validation-file", str(args.reference_validation_file)])
     if args.reference_test_file is not None:
         command.extend(["--reference-test-file", str(args.reference_test_file)])
+    if args.reference_composition_name is not None:
+        command.extend(["--reference-composition-name", str(args.reference_composition_name)])
+    if args.reference_composition_domains:
+        command.extend(["--reference-composition-domains", *list(args.reference_composition_domains)])
+    if args.trajectory_instruction_file is not None:
+        command.extend(
+            [
+                "--trajectory-instruction-file",
+                str(args.trajectory_instruction_file),
+                "--trajectory-instruction-evaluator",
+                str(args.trajectory_instruction_evaluator),
+            ]
+        )
     if args.benchmark_evals:
         command.extend(["--benchmark-evals", *list(args.benchmark_evals)])
+    if args.extra_evals:
+        command.extend(["--extra-evals", *list(args.extra_evals)])
     if args.eval_max_examples is not None:
         command.extend(["--eval-max-examples", str(args.eval_max_examples)])
     if args.benchmark_max_examples is not None:
@@ -1969,6 +2673,18 @@ def run_training_command(command: list[str], dry_run: bool) -> tuple[float, int]
     return time.perf_counter() - start, int(completed.returncode)
 
 
+def completed_training_run(run_output_dir: Path) -> bool:
+    summary_path = run_output_dir / "summary.json"
+    final_adapter = run_output_dir / "final_adapter"
+    if not summary_path.exists() or not final_adapter.exists():
+        return False
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return int(summary.get("completed_steps") or 0) > 0
+
+
 def copy_file_unless_same(src: Path, dst: Path) -> None:
     if src.resolve() == dst.resolve():
         return
@@ -1990,10 +2706,42 @@ def evaluate_base_model_once(
 ) -> dict[str, Any] | None:
     base_eval_path = output_dir / "base_model_eval.json"
     base_eval_output_dir = output_dir / "base_model_eval"
+    target_evaluator = args.evaluator
     ood_evaluator = args.ood_evaluator or args.evaluator
+    reference_evaluator = args.reference_evaluator or "none"
+    instruction_evaluator = args.trajectory_instruction_evaluator
+    extra_eval_specs = parse_extra_eval_specs(args.extra_evals)
+    target_eval_cache_tag = "target_none"
+    if args.eval_file and target_evaluator not in {"none", "bias_disentangle"}:
+        target_eval_cache_tag = f"target_{safe_slug(target_evaluator)}_{file_fingerprint(args.eval_file)}"
     ood_eval_cache_tag = "ood_none"
     if args.ood_eval_file and ood_evaluator not in {"none", "bias_disentangle"}:
         ood_eval_cache_tag = f"ood_{safe_slug(ood_evaluator)}_{file_fingerprint(args.ood_eval_file)}"
+    reference_eval_cache_tag = "reference_none"
+    if args.reference_test_file and reference_evaluator not in {"none", "loss", "bias_disentangle"}:
+        reference_eval_cache_tag = (
+            f"reference_{safe_slug(reference_evaluator)}_{file_fingerprint(args.reference_test_file)}"
+        )
+    instruction_eval_cache_tag = "instruction_none"
+    if args.trajectory_instruction_file and instruction_evaluator not in {"none", "bias_disentangle"}:
+        instruction_eval_cache_tag = (
+            f"instruction_{safe_slug(instruction_evaluator)}_"
+            f"{file_fingerprint(args.trajectory_instruction_file)}"
+        )
+    extra_eval_cache_tag = "extra_none"
+    if extra_eval_specs:
+        extra_eval_cache_tag = "extra_" + hashlib.sha1(
+            json.dumps(
+                [
+                    {
+                        **spec,
+                        "fingerprint": file_fingerprint(spec["file"]),
+                    }
+                    for spec in extra_eval_specs
+                ],
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:12]
     bias_eval_cache_tag = "bias_none"
     if bias_eval_data_path is not None:
         bias_eval_cache_tag = f"bias_{file_fingerprint(bias_eval_data_path)}"
@@ -2002,7 +2750,11 @@ def evaluate_base_model_once(
             "base_model_eval",
             safe_slug(args.model_name),
             safe_slug(args.train_torch_dtype),
+            target_eval_cache_tag,
             ood_eval_cache_tag,
+            reference_eval_cache_tag,
+            instruction_eval_cache_tag,
+            extra_eval_cache_tag,
             bias_eval_cache_tag,
         ]
     )
@@ -2013,8 +2765,19 @@ def evaluate_base_model_once(
             "output_file": str(base_eval_path.resolve()),
             "shared_output_file": str(shared_base_eval_path.resolve()),
             "output_dir": str(base_eval_output_dir.resolve()),
+            "target_eval_file": None if args.eval_file is None else str(Path(args.eval_file).resolve()),
+            "target_evaluator": target_evaluator,
             "ood_eval_file": None if args.ood_eval_file is None else str(Path(args.ood_eval_file).resolve()),
             "ood_evaluator": ood_evaluator,
+            "reference_eval_file": None
+            if args.reference_test_file is None
+            else str(Path(args.reference_test_file).resolve()),
+            "reference_evaluator": reference_evaluator,
+            "instruction_eval_file": None
+            if args.trajectory_instruction_file is None
+            else str(Path(args.trajectory_instruction_file).resolve()),
+            "instruction_evaluator": instruction_evaluator,
+            "extra_evals": extra_eval_specs,
             "bias_eval_data_path": None if bias_eval_data_path is None else str(Path(bias_eval_data_path).resolve()),
             "eval_max_examples": args.eval_max_examples,
             "bias_eval_max_examples": args.bias_eval_max_examples,
@@ -2023,12 +2786,46 @@ def evaluate_base_model_once(
         write_json(payload, base_eval_path)
         return payload
 
+    target_records = (
+        load_records(args.eval_file)
+        if args.eval_file and target_evaluator not in {"none", "bias_disentangle"}
+        else []
+    )
     ood_records = (
         load_records(args.ood_eval_file)
         if args.ood_eval_file and ood_evaluator not in {"none", "bias_disentangle"}
         else []
     )
-    if not ood_records and bias_eval_data_path is None:
+    reference_records = (
+        load_records(args.reference_test_file)
+        if args.reference_test_file
+        and reference_evaluator not in {"none", "loss", "bias_disentangle"}
+        else []
+    )
+    instruction_records = (
+        load_records(args.trajectory_instruction_file)
+        if args.trajectory_instruction_file
+        and instruction_evaluator not in {"none", "bias_disentangle"}
+        else []
+    )
+    extra_eval_records = [
+        {
+            **spec,
+            "records": load_records(spec["file"])
+            if spec["evaluator"] not in {"none", "bias_disentangle", "loss"}
+            else [],
+        }
+        for spec in extra_eval_specs
+    ]
+    if not any(
+        (
+            target_records,
+            ood_records,
+            reference_records,
+            instruction_records,
+            any(item["records"] for item in extra_eval_records),
+        )
+    ) and bias_eval_data_path is None:
         return None
     if shared_base_eval_path.exists():
         payload = json.loads(shared_base_eval_path.read_text(encoding="utf-8"))
@@ -2039,8 +2836,19 @@ def evaluate_base_model_once(
 
     payload: dict[str, Any] = {
         "model_name": args.model_name,
+        "target_eval_file": None if args.eval_file is None else str(Path(args.eval_file).resolve()),
+        "target_evaluator": target_evaluator,
         "ood_eval_file": None if args.ood_eval_file is None else str(Path(args.ood_eval_file).resolve()),
         "ood_evaluator": ood_evaluator,
+        "reference_eval_file": None
+        if args.reference_test_file is None
+        else str(Path(args.reference_test_file).resolve()),
+        "reference_evaluator": reference_evaluator,
+        "instruction_eval_file": None
+        if args.trajectory_instruction_file is None
+        else str(Path(args.trajectory_instruction_file).resolve()),
+        "instruction_evaluator": instruction_evaluator,
+        "extra_evals": extra_eval_specs,
         "bias_eval_data_path": None if bias_eval_data_path is None else str(Path(bias_eval_data_path).resolve()),
         "eval_max_examples": args.eval_max_examples,
         "bias_eval_max_examples": args.bias_eval_max_examples,
@@ -2048,7 +2856,7 @@ def evaluate_base_model_once(
 
     model = None
     tokenizer = None
-    if ood_records:
+    if any((target_records, ood_records, reference_records, instruction_records, any(item["records"] for item in extra_eval_records))):
         base_eval_args = argparse.Namespace(
             model_name_or_path=args.model_name,
             use_slow_tokenizer=False,
@@ -2060,32 +2868,88 @@ def evaluate_base_model_once(
         device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
         model.to(device)
         model.eval()
-        if ood_evaluator == "humaneval":
-            ood_metrics = humaneval_evaluator.evaluate_records(
+        if target_records:
+            evaluator = get_evaluator(target_evaluator)
+            target_metrics = evaluator(
                 model=model,
                 tokenizer=tokenizer,
-                records=ood_records,
-                device=device,
-                max_examples=args.eval_max_examples,
-                max_new_tokens=args.generation_max_new_tokens,
-                add_bos_token=args.add_bos_token,
-                num_samples=args.humaneval_num_samples,
-                pass_at_ks=tuple(args.humaneval_pass_at_ks),
-                temperature=args.humaneval_temperature,
-                top_p=args.humaneval_top_p,
-            )
-        else:
-            evaluator = get_evaluator(ood_evaluator)
-            ood_metrics = evaluator(
-                model=model,
-                tokenizer=tokenizer,
-                records=ood_records,
+                records=target_records,
                 device=device,
                 max_examples=args.eval_max_examples,
                 max_new_tokens=args.generation_max_new_tokens,
                 add_bos_token=args.add_bos_token,
             )
-        payload.update({f"base_ood_{key}": value for key, value in ood_metrics.items()})
+            payload.update({f"base_target_{key}": value for key, value in target_metrics.items()})
+        if ood_records:
+            if ood_evaluator == "humaneval":
+                ood_metrics = humaneval_evaluator.evaluate_records(
+                    model=model,
+                    tokenizer=tokenizer,
+                    records=ood_records,
+                    device=device,
+                    max_examples=args.eval_max_examples,
+                    max_new_tokens=args.ood_generation_max_new_tokens or args.generation_max_new_tokens,
+                    add_bos_token=args.add_bos_token,
+                    num_samples=args.humaneval_num_samples,
+                    pass_at_ks=tuple(args.humaneval_pass_at_ks),
+                    temperature=args.humaneval_temperature,
+                    top_p=args.humaneval_top_p,
+                )
+            else:
+                evaluator = get_evaluator(ood_evaluator)
+                ood_metrics = evaluator(
+                    model=model,
+                    tokenizer=tokenizer,
+                    records=ood_records,
+                    device=device,
+                    max_examples=args.eval_max_examples,
+                    max_new_tokens=args.ood_generation_max_new_tokens or args.generation_max_new_tokens,
+                    add_bos_token=args.add_bos_token,
+                )
+            payload.update({f"base_ood_{key}": value for key, value in ood_metrics.items()})
+        if reference_records:
+            evaluator = get_evaluator(reference_evaluator)
+            reference_metrics = evaluator(
+                model=model,
+                tokenizer=tokenizer,
+                records=reference_records,
+                device=device,
+                max_examples=args.eval_max_examples,
+                max_new_tokens=args.reference_generation_max_new_tokens or args.generation_max_new_tokens,
+                add_bos_token=args.add_bos_token,
+            )
+            payload.update({f"base_reference_{key}": value for key, value in reference_metrics.items()})
+        if instruction_records:
+            evaluator = get_evaluator(instruction_evaluator)
+            instruction_metrics = evaluator(
+                model=model,
+                tokenizer=tokenizer,
+                records=instruction_records,
+                device=device,
+                max_examples=args.eval_max_examples,
+                max_new_tokens=args.reference_generation_max_new_tokens or args.generation_max_new_tokens,
+                add_bos_token=args.add_bos_token,
+            )
+            payload.update({f"base_instruction_{key}": value for key, value in instruction_metrics.items()})
+        for item in extra_eval_records:
+            if not item["records"]:
+                continue
+            evaluator = get_evaluator(item["evaluator"])
+            metrics = evaluator(
+                model=model,
+                tokenizer=tokenizer,
+                records=item["records"],
+                device=device,
+                max_examples=args.eval_max_examples,
+                max_new_tokens=args.reference_generation_max_new_tokens or args.generation_max_new_tokens,
+                add_bos_token=args.add_bos_token,
+            )
+            payload.update(
+                {
+                    f"base_extra_eval_{item['name']}_{key}": value
+                    for key, value in metrics.items()
+                }
+            )
 
     if model is not None:
         del model
@@ -2280,6 +3144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-file", default=None)
     parser.add_argument("--reference-validation-file", default=None)
     parser.add_argument("--reference-test-file", default=None)
+    parser.add_argument("--reference-composition-name", default=None)
+    parser.add_argument("--reference-composition-domains", nargs="*", default=[])
     parser.add_argument("--reference-hf-stereoset", action="store_true")
     parser.add_argument("--reference-hf-subset", default="intrasentence")
     parser.add_argument("--reference-hf-split", default="validation")
@@ -2314,7 +3180,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-shared-selector-cache-only", action="store_true")
     parser.add_argument("--skip-training", action="store_true")
     parser.add_argument("--skip-final-evaluation", action="store_true")
+    parser.add_argument(
+        "--resume-completed-runs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip training outputs that already contain a completed summary and final adapter.",
+    )
     parser.add_argument("--save-selected-artifacts", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--plot-update-trajectory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Plot selector-prefix and optimizer-step SAFE constraint diagnostics.",
+    )
     parser.add_argument(
         "--run-entanglement-analysis",
         action=argparse.BooleanOptionalAction,
@@ -2363,10 +3241,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=["hard", "soft"], default="soft")
     parser.add_argument("--selector-feature-method", choices=["random_sketch", "low_rank"], default="low_rank")
     parser.add_argument("--selector-preconditioner", choices=["sgd", "adam"], default="adam")
+    parser.add_argument(
+        "--adam-selection-mode",
+        choices=["post_projection", "precondition_before_projection"],
+        default="post_projection",
+        help=(
+            "Adam selector approximation. 'post_projection' preserves the legacy "
+            "P_K B_K path; 'precondition_before_projection' builds candidate features "
+            "and the residual task basis from full-coordinate frozen-Adam updates."
+        ),
+    )
+    parser.add_argument(
+        "--adam-selection-effective-learning-rate",
+        type=float,
+        default=None,
+        help=(
+            "Optional cumulative learning-rate scale for "
+            "precondition_before_projection. By default it is the sum of the planned "
+            "training learning-rate schedule."
+        ),
+    )
     parser.add_argument("--less-similarity", choices=["dot", "cosine"], default="cosine")
     parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--adam-eps", type=float, default=1e-8)
     parser.add_argument("--adam-warmup-steps", type=float, default=0.1)
+    parser.add_argument("--selection-candidate-max-examples", type=int, default=None)
+    parser.add_argument("--selection-candidate-subsample-seed", type=int, default=None)
+    parser.add_argument("--legacy-disjoint-preconditioner-pool", action="store_true")
     parser.add_argument("--preconditioner-split-seed", type=int, default=42)
     parser.add_argument("--selector-projection-dim", type=int, default=8192)
     parser.add_argument("--selector-projection-seed", type=int, default=13)
@@ -2376,11 +3277,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safe-alpha", type=parse_auto_float, default=1e-3)
     parser.add_argument("--safe-learning-rate", type=float, default=1.0)
     parser.add_argument("--safe-geometry", choices=["euclidean", "reference"], default="reference")
-    parser.add_argument("--safe-solver", choices=["rank", "greedy_marginal"], default="greedy_marginal")
+    parser.add_argument(
+        "--safe-solver",
+        choices=["rank", "greedy_marginal", "constrained_greedy", "relaxed"],
+        default="constrained_greedy",
+    )
     parser.add_argument("--safe-shortlist-size", type=int, default=None)
     parser.add_argument("--safe-average-by-budget", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--safe-feasibility-tolerance", type=float, default=1.0e-6)
+    parser.add_argument("--safe-objective-tolerance", type=float, default=1.0e-12)
+    parser.add_argument("--safe-greedy-swap-passes", type=int, default=1)
+    parser.add_argument("--safe-relaxed-cvx-solver", choices=["CLARABEL", "SCS"], default="CLARABEL")
+    parser.add_argument("--safe-relaxed-weight-threshold", type=float, default=1.0e-8)
     parser.add_argument("--safe-cost-c", type=float, default=None)
+    parser.add_argument(
+        "--safe-cost-beta",
+        type=float,
+        default=None,
+        help="Set rho to beta times the Fisher cost of the norm-epsilon unconstrained target step.",
+    )
+    parser.add_argument(
+        "--safe-cost-gamma",
+        type=float,
+        default=None,
+        help="Set rho = 0.5 * gamma * q0 * epsilon^2 for a normalized target direction.",
+    )
     parser.add_argument("--safe-epsilon", type=float, default=None)
+    parser.add_argument("--safe-epsilon-multiplier", type=float, default=None)
+    parser.add_argument("--safe-epsilon-calibration-samples", type=int, default=64)
+    parser.add_argument("--safe-epsilon-calibration-seed", type=int, default=None)
+    parser.add_argument(
+        "--safe-training-constraint-mode",
+        choices=["none", "cumulative_line_search", "equal_allocation"],
+        default="none",
+        help=(
+            "Optional projected optimizer updates: cumulative_line_search enforces the "
+            "global Fisher/norm budgets from the base checkpoint; equal_allocation uses "
+            "the conservative per-step rho/T^2 and epsilon/T allocation."
+        ),
+    )
+    parser.add_argument(
+        "--safe-training-epsilon-scale-by-steps",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use selector epsilon times the resolved optimizer-step horizon as the "
+            "training trajectory radius."
+        ),
+    )
     parser.add_argument("--reference-fisher-max-examples", type=int, default=1024)
     parser.add_argument("--low-rank-reference-rank", type=parse_auto_int, default=256)
     parser.add_argument("--low-rank-builder-alpha", type=float, default=1e-3)
@@ -2419,16 +3363,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument("--eval-steps", type=int, default=20)
     parser.add_argument("--save-steps", type=int, default=0)
+    parser.add_argument("--kl-regularization-lambda", type=float, default=0.0)
+    parser.add_argument("--kl-reference-max-examples", type=int, default=128)
+    parser.add_argument("--trajectory-eval-steps", type=int, default=0)
+    parser.add_argument("--trajectory-reference-max-examples", type=int, default=64)
+    parser.add_argument("--trajectory-target-max-examples", type=int, default=64)
+    parser.add_argument("--trajectory-generation-eval-steps", type=int, default=0)
+    parser.add_argument("--trajectory-generation-max-examples", type=int, default=16)
+    parser.add_argument("--trajectory-generation-max-new-tokens", type=int, default=32)
+    parser.add_argument("--trajectory-target-evaluator", default=None)
+    parser.add_argument("--trajectory-reference-evaluator", default="medical_reference")
+    parser.add_argument("--trajectory-instruction-file", default=None)
+    parser.add_argument("--trajectory-instruction-evaluator", default="ifeval_proxy")
     parser.add_argument("--evaluator", default="humaneval")
     parser.add_argument("--ood-evaluator", default=None)
     parser.add_argument("--reference-evaluator", default=None)
     parser.add_argument("--eval-max-examples", type=int, default=None)
     parser.add_argument("--generation-max-new-tokens", type=int, default=256)
+    parser.add_argument("--ood-generation-max-new-tokens", type=int, default=None)
+    parser.add_argument("--reference-generation-max-new-tokens", type=int, default=None)
     parser.add_argument("--humaneval-num-samples", type=int, default=1)
     parser.add_argument("--humaneval-pass-at-ks", nargs="+", type=int, default=[1])
     parser.add_argument("--humaneval-temperature", type=float, default=0.8)
     parser.add_argument("--humaneval-top-p", type=float, default=0.95)
     parser.add_argument("--benchmark-evals", nargs="*", choices=["mmlu", "gsm8k"], default=[])
+    parser.add_argument(
+        "--extra-evals",
+        nargs="*",
+        default=[],
+        help="Named held-out evals as NAME=EVALUATOR:/path/to/file.jsonl.",
+    )
     parser.add_argument("--benchmark-max-examples", type=int, default=None)
     parser.add_argument("--benchmark-mmlu-subset", default="all")
     parser.add_argument("--benchmark-mmlu-split", default="test")
@@ -2464,6 +3428,29 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if sum(
+        value is not None
+        for value in (args.safe_cost_c, args.safe_cost_beta, args.safe_cost_gamma)
+    ) > 1:
+        raise ValueError(
+            "Use exactly one of --safe-cost-c, --safe-cost-beta, or "
+            "--safe-cost-gamma."
+        )
+    if args.safe_epsilon is not None and args.safe_epsilon_multiplier is not None:
+        raise ValueError("Use either --safe-epsilon or --safe-epsilon-multiplier, not both.")
+    if args.safe_epsilon_calibration_samples <= 0:
+        raise ValueError("--safe-epsilon-calibration-samples must be positive.")
+    if args.safe_training_epsilon_scale_by_steps:
+        if args.safe_training_constraint_mode == "none":
+            raise ValueError(
+                "--safe-training-epsilon-scale-by-steps requires a SAFE training "
+                "constraint mode."
+            )
+        if args.safe_epsilon is None and args.safe_epsilon_multiplier is None:
+            raise ValueError(
+                "--safe-training-epsilon-scale-by-steps requires --safe-epsilon "
+                "or --safe-epsilon-multiplier."
+            )
     if not args.compute_validation_gradient:
         args.compute_validation_gradient = True
     if (args.reference_file is not None or args.reference_hf_stereoset) and not args.compute_reference_fisher:
@@ -2569,6 +3556,8 @@ def main() -> None:
         "target_split_seed": args.target_split_seed,
         "target_split_sizes": {name: len(split) for name, split in target_splits.items()},
         "reference_file": None if args.reference_file is None else str(Path(args.reference_file).resolve()),
+        "reference_composition_name": args.reference_composition_name,
+        "reference_composition_domains": list(args.reference_composition_domains or []),
         "reference_validation_file": None if args.reference_validation_file is None else str(Path(args.reference_validation_file).resolve()),
         "reference_validation_count": count_optional_records(args.reference_validation_file),
         "reference_test_file": None if args.reference_test_file is None else str(Path(args.reference_test_file).resolve()),
@@ -2593,6 +3582,19 @@ def main() -> None:
         "selectors": args.selectors,
         "selector_feature_method": args.selector_feature_method,
         "selector_preconditioner": args.selector_preconditioner,
+        "adam_selection_mode": args.adam_selection_mode,
+        "adam_selection_effective_learning_rate": args.adam_selection_effective_learning_rate,
+        "safe_cost_c": args.safe_cost_c,
+        "safe_cost_beta": args.safe_cost_beta,
+        "safe_cost_gamma": args.safe_cost_gamma,
+        "safe_epsilon": args.safe_epsilon,
+        "safe_epsilon_multiplier": args.safe_epsilon_multiplier,
+        "safe_epsilon_calibration_samples": args.safe_epsilon_calibration_samples,
+        "safe_epsilon_calibration_seed": args.safe_epsilon_calibration_seed,
+        "safe_training_constraint_mode": args.safe_training_constraint_mode,
+        "safe_training_epsilon_scale_by_steps": bool(
+            args.safe_training_epsilon_scale_by_steps
+        ),
         "preconditioner_split_seed": args.preconditioner_split_seed,
         "less_similarity": args.less_similarity,
         "feature_cache_dir": str(Path(args.feature_cache_dir).resolve()),
@@ -2622,6 +3624,7 @@ def main() -> None:
         "entanglement_target_sample_size": args.entanglement_target_sample_size,
         "entanglement_selected_csv_max_rows": args.entanglement_selected_csv_max_rows,
         "base_model_eval": base_model_eval,
+        "extra_evals": parse_extra_eval_specs(args.extra_evals),
         "runs": [],
     }
 
@@ -2670,6 +3673,13 @@ def main() -> None:
                 selection_info["subset_percentage"] = subset_percentage
                 method_tag = str(selection_info["selector"])
 
+            if args.safe_training_constraint_mode != "none":
+                method_tag = (
+                    f"{method_tag}_trainconstraint_"
+                    f"{safe_slug(args.safe_training_constraint_mode)}"
+                )
+                if args.safe_training_epsilon_scale_by_steps:
+                    method_tag = f"{method_tag}_eps_times_steps"
             if selector == "full":
                 run_output_dir = training_output_dir / f"{method_tag}_seed{args.seed}"
             else:
@@ -2678,6 +3688,31 @@ def main() -> None:
                 f"[selection] selector={selector} method_tag={method_tag} "
                 f"train_file={train_file} output_dir={run_output_dir}"
             )
+            if args.resume_completed_runs and completed_training_run(run_output_dir):
+                command = build_train_command(
+                    args,
+                    train_file=train_file,
+                    run_output_dir=run_output_dir,
+                    selector=selector,
+                    selection_info=selection_info,
+                )
+                print(f"[training] reusing completed run: {run_output_dir}")
+                manifest["runs"].append(
+                    {
+                        "selector": selector,
+                        "method_tag": method_tag,
+                        "subset_percentage": subset_percentage,
+                        "subset_budget": subset_budget if selector != "full" else len(candidates),
+                        "train_file": str(train_file),
+                        "run_output_dir": str(run_output_dir),
+                        "selection": selection_info,
+                        "train_command": command,
+                        "train_wallclock_seconds": 0.0,
+                        "train_return_code": 0,
+                        "reused_completed_run": True,
+                    }
+                )
+                continue
             selection_artifacts = save_selected_artifacts_for_run(
                 args=args,
                 candidates=candidates,
@@ -2699,13 +3734,30 @@ def main() -> None:
                 selector=selector,
                 method_tag=method_tag,
             )
-            command = build_train_command(args, train_file=train_file, run_output_dir=run_output_dir)
+            command = build_train_command(
+                args,
+                train_file=train_file,
+                run_output_dir=run_output_dir,
+                selector=selector,
+                selection_info=selection_info,
+            )
             train_seconds = 0.0
             return_code = 0
             if not args.skip_training:
                 train_seconds, return_code = run_training_command(command, dry_run=args.dry_run)
+            merge_selection_info_into_training_summary(run_output_dir, selection_info)
+            merge_base_model_eval_into_training_summary(run_output_dir, base_model_eval)
             merge_selection_artifacts_into_training_summary(run_output_dir, selection_artifacts)
             merge_entanglement_into_training_summary(run_output_dir, entanglement_info)
+            update_trajectory_plot = None
+            if (
+                selector == "safe"
+                and args.plot_update_trajectory
+                and not args.dry_run
+                and (run_output_dir / "summary.json").exists()
+            ):
+                update_trajectory_plot = generate_update_trajectory_plot(run_output_dir)
+                merge_update_trajectory_plot_into_summary(run_output_dir, update_trajectory_plot)
 
             manifest["runs"].append(
                 {
@@ -2718,6 +3770,7 @@ def main() -> None:
                     "selection": selection_info,
                     "selection_artifacts": selection_artifacts,
                     "entanglement": entanglement_info,
+                    "update_constraint_trajectory_plot": update_trajectory_plot,
                     "train_command": command,
                     "train_wallclock_seconds": train_seconds,
                     "train_return_code": return_code,
