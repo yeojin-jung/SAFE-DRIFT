@@ -7,6 +7,31 @@ from typing import Any
 import torch
 
 
+def apply_update_preconditioner(
+    values: torch.Tensor,
+    preconditioner: torch.Tensor | None,
+) -> tuple[torch.Tensor, str]:
+    tensor = values.detach().to(dtype=torch.float32, device="cpu")
+    if preconditioner is None:
+        return tensor, "none"
+
+    operator = preconditioner.detach().to(dtype=torch.float32, device="cpu")
+    feature_dim = int(tensor.shape[-1])
+    if operator.ndim == 1:
+        if int(operator.numel()) != feature_dim:
+            raise ValueError(
+                "1D preconditioner width must match the gradient feature dimension."
+            )
+        return tensor * operator, "diagonal"
+    if operator.ndim == 2:
+        if tuple(operator.shape) != (feature_dim, feature_dim):
+            raise ValueError(
+                "2D preconditioner must have shape [feature_dim, feature_dim]."
+            )
+        return tensor @ operator.T, "matrix"
+    raise ValueError("preconditioner must be a 1D diagonal vector or a 2D matrix.")
+
+
 def random_subset_update_norm_calibration(
     candidate_gradients: torch.Tensor,
     *,
@@ -27,11 +52,10 @@ def random_subset_update_norm_calibration(
     if not math.isfinite(float(learning_rate)) or float(learning_rate) <= 0.0:
         raise ValueError("learning_rate must be positive and finite.")
 
-    scale = None
-    if preconditioner is not None:
-        scale = preconditioner.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
-        if int(scale.numel()) != int(feature_dim):
-            raise ValueError("preconditioner width must match the candidate feature dimension.")
+    preconditioner_shape = (
+        None if preconditioner is None else list(preconditioner.shape)
+    )
+    preconditioner_kind = "none"
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
@@ -39,8 +63,10 @@ def random_subset_update_norm_calibration(
     for _ in range(int(sample_count)):
         indices = torch.randperm(int(num_candidates), generator=generator)[: int(subset_budget)]
         mean_gradient = gradients.index_select(0, indices).mean(dim=0)
-        if scale is not None:
-            mean_gradient = mean_gradient * scale
+        mean_gradient, preconditioner_kind = apply_update_preconditioner(
+            mean_gradient,
+            preconditioner,
+        )
         update_norms.append(
             float(float(learning_rate) * torch.linalg.vector_norm(mean_gradient).item())
         )
@@ -58,7 +84,9 @@ def random_subset_update_norm_calibration(
         "safe_epsilon_calibration_candidate_count": int(num_candidates),
         "safe_epsilon_calibration_feature_dim": int(feature_dim),
         "safe_epsilon_calibration_learning_rate": float(learning_rate),
-        "safe_epsilon_calibration_uses_preconditioner": scale is not None,
+        "safe_epsilon_calibration_uses_preconditioner": preconditioner is not None,
+        "safe_epsilon_calibration_preconditioner_kind": preconditioner_kind,
+        "safe_epsilon_calibration_preconditioner_shape": preconditioner_shape,
         "safe_epsilon_calibration_update_norm_min": float(min(update_norms)),
         "safe_epsilon_calibration_update_norm_mean": float(
             sum(update_norms) / len(update_norms)
@@ -81,14 +109,12 @@ def coupled_reference_budget(
     fisher = reference_fisher.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
     if int(target.numel()) != int(fisher.numel()):
         raise ValueError("target_gradient and reference_fisher must have the same width.")
-    if preconditioner is not None:
-        scale = preconditioner.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
-        if int(scale.numel()) != int(target.numel()):
-            raise ValueError("preconditioner width must match the target feature dimension.")
-        target = target * scale
-        direction_source = "negative_normalized_preconditioned_target_gradient"
-    else:
-        direction_source = "negative_normalized_target_gradient"
+    target, preconditioner_kind = apply_update_preconditioner(target, preconditioner)
+    direction_source = (
+        "negative_normalized_target_gradient"
+        if preconditioner is None
+        else "negative_normalized_preconditioned_target_gradient"
+    )
 
     target_norm = float(torch.linalg.vector_norm(target).item())
     if not math.isfinite(target_norm) or target_norm <= 0.0:
@@ -106,6 +132,10 @@ def coupled_reference_budget(
     return float(rho), {
         "safe_cost_gamma": float(gamma),
         "safe_reference_direction_source": direction_source,
+        "safe_reference_direction_preconditioner_kind": preconditioner_kind,
+        "safe_reference_direction_preconditioner_shape": (
+            None if preconditioner is None else list(preconditioner.shape)
+        ),
         "safe_reference_direction_norm": target_norm,
         "safe_reference_curvature_q0": q0,
         "safe_effective_cost_c": float(rho),

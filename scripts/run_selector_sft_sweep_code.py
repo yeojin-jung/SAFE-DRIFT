@@ -2745,7 +2745,7 @@ def evaluate_base_model_once(
     bias_eval_cache_tag = "bias_none"
     if bias_eval_data_path is not None:
         bias_eval_cache_tag = f"bias_{file_fingerprint(bias_eval_data_path)}"
-    shared_cache_stem = "_".join(
+    shared_cache_identity = "_".join(
         [
             "base_model_eval",
             safe_slug(args.model_name),
@@ -2758,12 +2758,22 @@ def evaluate_base_model_once(
             bias_eval_cache_tag,
         ]
     )
+    shared_cache_stem = "_".join(
+        [
+            "base_model_eval",
+            safe_slug(args.model_name)[:48],
+            safe_slug(args.train_torch_dtype),
+            hashlib.sha256(shared_cache_identity.encode("utf-8")).hexdigest()[:20],
+        ]
+    )
     shared_base_eval_path = Path(args.feature_cache_dir).resolve().parent / f"{shared_cache_stem}.json"
     shared_base_eval_output_dir = Path(args.feature_cache_dir).resolve().parent / shared_cache_stem
     if args.dry_run:
         payload = {
             "output_file": str(base_eval_path.resolve()),
             "shared_output_file": str(shared_base_eval_path.resolve()),
+            "shared_cache_identity": shared_cache_identity,
+            "shared_cache_stem": shared_cache_stem,
             "output_dir": str(base_eval_output_dir.resolve()),
             "target_eval_file": None if args.eval_file is None else str(Path(args.eval_file).resolve()),
             "target_evaluator": target_evaluator,
@@ -2836,6 +2846,8 @@ def evaluate_base_model_once(
 
     payload: dict[str, Any] = {
         "model_name": args.model_name,
+        "shared_cache_identity": shared_cache_identity,
+        "shared_cache_stem": shared_cache_stem,
         "target_eval_file": None if args.eval_file is None else str(Path(args.eval_file).resolve()),
         "target_evaluator": target_evaluator,
         "ood_eval_file": None if args.ood_eval_file is None else str(Path(args.ood_eval_file).resolve()),
