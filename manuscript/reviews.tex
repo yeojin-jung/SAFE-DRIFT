@@ -1,0 +1,206 @@
+\documentclass{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, xcolor}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage[most]{tcolorbox}
+
+\titleformat{\section}{\normalfont\Large\bfseries}{\thesection}{1em}{}
+\newcommand{\score}[2]{\textbf{#1:} #2}
+
+% Empty box for writing the rebuttal response to a single weakness / question / limitation.
+\newtcolorbox{answerbox}{
+  colback=gray!4, colframe=gray!55, boxrule=0.4pt, arc=1mm,
+  left=5pt, right=5pt, top=3pt, bottom=3pt, boxsep=1pt,
+  height=2.1cm, valign=top,
+  before skip=2pt, after skip=8pt
+}
+\newcommand{\response}[1][Response]{%
+  \begin{answerbox}\textit{\small #1:}\end{answerbox}
+}
+
+\title{NeurIPS Rebuttal Workspace}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+%=====================================================================
+\section{Rebuttal Checklist}
+\label{sec:checklist}
+
+Priority experiments and writing fixes for the rebuttal, ordered by how many
+reviewers/AC raised the point and by feasibility. \textbf{AC-$n$} tags map to the
+AC's five prioritized questions (Section~\ref{sec:ac}); \textbf{R$n$-*} tags map to
+the specific reviewer item (Section~\ref{sec:reviews}).
+
+\subsection*{Experiments}
+\begin{enumerate}
+    \item $\square$ Predicted-vs-realized drift correlation analysis (Fisher cost $\leftrightarrow$ KL $\leftrightarrow$ downstream degradation), across the full training trajectory, not just start/end. [\textbf{AC-2}; R1-W2, R2-W4, R3-W2, R3-W3]
+    \item $\square$ End-to-end compute/memory/runtime report, scaling with dataset size and model size, vs.\ all baselines. [\textbf{AC-1}; R1-Q1, R1-Q2, R2-W4, R3-W5]
+    \item $\square$ Reference-set coverage ablation (narrow vs.\ broad reference set; in-set vs.\ held-out drift). [\textbf{AC-3}; R1-Limitations, R2-W3, R3-W1]
+    \item $\square$ Add forgetting- / safety-drift-aware baselines beyond target-oriented data selection (e.g.\ EWC, replay, KL-regularized fine-tuning). [\textbf{AC-4}; R1-Q4, R2-W2]
+    \item $\square$ Validate on at least one additional model architecture (e.g.\ Qwen, Mistral) and one larger model (13B+). [\textbf{AC-5}; R1-Q2, R3-W4]
+    \item $\square$ $\rho$ sweep across optimizer (Adam/SGD) $\times$ dataset. [R1-W1]
+    \item $\square$ Same-compute comparison: SAFE-DRIFT (small selected pool) vs.\ naive larger unselected pool. [R1-Q3]
+    \item $\square$ Trade-off (Pareto) plot: target gain vs.\ reference drift, all methods/datasets. [R2-W1]
+    \item $\square$ Low-rank approximation error vs.\ rank $(K_R,K_T)$; target-gradient-as-mean robustness under heterogeneous/outlier target data. [R1-W2, R1-W3]
+    \item $\square$ (Stretch) Full-parameter fine-tuning and/or DPO setting on one benchmark. [R3-W4]
+\end{enumerate}
+
+\subsection*{Writing fixes (no new experiments)}
+\begin{itemize}
+    \item $\square$ Revise target-performance framing to be explicit about the target-vs-drift trade-off, rather than implying comprehensive outperformance. [R2-W1]
+    \item $\square$ Soften ``SAFE'' / ``safe'' terminology and title framing to match what the reference-set KL actually establishes. [\textbf{AC-3}; R3-W1]
+    \item $\square$ Expand discussion of the reference-set coverage assumption using the coverage-ablation results. [\textbf{AC-3}; R1-Limitations, R2-W3]
+    \item $\square$ Explicitly position SAFE-DRIFT relative to catastrophic-forgetting / off-target-shift literature. [\textbf{AC-4}; R1-Q4, R2-W2]
+\end{itemize}
+
+%=====================================================================
+\section{Meta-Review (AC)}
+\label{sec:ac}
+
+\begin{quote}
+\itshape
+The reviewers and I all agree this work targets a very important problem, i.e., data
+selection for post SFT and focus on the off-target shift issue.
+
+Prioritized questions for rebuttal:
+\begin{enumerate}
+    \item all reviewers raised concerns about the computational complexity.
+    \item how accurately the predicted quadratic drift corresponds to the drift after the complete training trajectory.
+    \item the assumption of having a well-represented reference set is too strong and impractical. ``SAFE'' would be an over-claimed title.
+    \item also compare with related work that address ``off-target shift'' or catastrophic forgetting when finetuning.
+    \item validate on other model architectures.
+\end{enumerate}
+\end{quote}
+
+%=====================================================================
+\section{Reviews}
+\label{sec:reviews}
+
+%---------------------------------------------------------------------
+\subsection{Reviewer 1}
+\label{sec:r1}
+
+\subsubsection*{Scores}
+\begin{itemize}[nosep]
+    \item \score{Quality}{3 (good)}
+    \item \score{Clarity}{4 (excellent)}
+    \item \score{Significance}{2 (not good)}
+    \item \score{Originality}{2 (not good)}
+    \item \score{Rating}{3 --- Borderline reject: Technically solid paper where reasons to reject, e.g., limited evaluation, outweigh reasons to accept, e.g., good evaluation. Please use sparingly.}
+    \item \score{Confidence}{3 --- You are fairly confident in your assessment. It is possible that you did not understand some parts of the submission or that you are unfamiliar with some pieces of related work. Math/other details were not carefully checked.}
+\end{itemize}
+
+\subsubsection*{Weaknesses}
+\begin{enumerate}
+    \item $\rho$ seems to be an important hyper-parameter, that can greatly influence the performance, any also kind of varies depending on the optimizer (Adam/sgd) or dataset
+    \response
+    \item Low-rank approximation is necessary (understandable), however, this kind of approximation does influence the sft performance / unable to capture the whole update induced by sft
+    \response
+    \item The target gradient as the mean of the sample mean seems to only capturing the mean data, it would kind of assume that you have very clean and useful data, without outlier and all pointing to the same direction, does not seem to be really feasible for real sft problems
+    \response
+\end{enumerate}
+
+\subsubsection*{Questions}
+\begin{enumerate}
+    \item How computational efficient is the approach? How does it scale with a growing dataset (reference, training and target), can you give me measurements? As in reality, SFT datasets can be quite huge
+    \response
+    \item Also, how does it scale with the model scale? As the tested models are either toy (linear model or 7B models), currently the sota llms are growing into the trillion scale, does it also remotely work there?
+    \response
+    \item Any ways to demonstrate the realistic gain of safe-drift? A bit building upon the above questions, let's say in reality given the same compute, if we simply increase the training data pool as compared to running this method (and building a much smaller pool), how does they compare?
+    \response
+    \item The baseline methods (dsir, less, etc.) are data selection that aimed to optimize the target task performance, naturally not having the objective of off-target drift, so safe-drift is the first method to have this kind of objective? if not, adding more relevant baselines are necessary
+    \response
+\end{enumerate}
+
+\subsubsection*{Limitations}
+\begin{enumerate}
+    \item The author mentioned the potential limitations of their method, as it relies on two assumptions: the reference set should cover the all the behavior that we want to preserve and it works only as single pass (useful for SFT). I believe the second limitation does not undermine the contribution of this work, as SFT has been extensively used and only targeting that can still have a great relevance, but the first limitation is real one, as building a reference set that covers the whole model behavior is extremely difficult
+    \response
+    \item The general applicability seems to be an issue for me
+    \response
+\end{enumerate}
+
+%---------------------------------------------------------------------
+\subsection{Reviewer 2}
+\label{sec:r2}
+
+\subsubsection*{Scores}
+\begin{itemize}[nosep]
+    \item \score{Quality}{3 (good)}
+    \item \score{Clarity}{3 (good)}
+    \item \score{Significance}{3 (good)}
+    \item \score{Originality}{3 (good)}
+    \item \score{Rating}{4 --- Borderline accept: Technically solid paper where reasons to accept outweigh reasons to reject, e.g., limited evaluation. Please use sparingly.}
+    \item \score{Confidence}{3 --- You are fairly confident in your assessment. It is possible that you did not understand some parts of the submission or that you are unfamiliar with some pieces of related work. Math/other details were not carefully checked.}
+\end{itemize}
+
+\subsubsection*{Weaknesses}
+\begin{enumerate}
+    \item The experimental gains are not stable enough. SAFE-DRIFT is not the best-performing method on several target metrics. In many cases, it appears to trade some target-task improvement for reduced off-target drift. Therefore, the paper should describe its target performance more cautiously, rather than implying that it comprehensively outperforms the baselines.
+    \response
+    \item The baselines are not comprehensive enough. The paper only compares against four data selection baselines: Random, LESS, DSIR, and Prismatic Synthesis. However, this problem is closely related to capability preservation after fine-tuning, safety drift, and forgetting, so more relevant baselines should be included.
+    \response
+    \item The choice of the reference set is too critical, but insufficiently discussed. The core assumption of SAFE-DRIFT is that the reference set can represent the non-target behaviors one wants to protect. The paper also acknowledges in its conclusion that if the reference distribution does not cover the capabilities that need to be protected, the observed drift may underestimate the true drift.
+    \response
+    \item The low-rank estimation method is complex, and its computational cost and stability need to be clarified further.
+    \response
+\end{enumerate}
+
+\subsubsection*{Questions}
+\begin{enumerate}
+    \item See Weaknesses.
+    \response
+\end{enumerate}
+
+\subsubsection*{Limitations}
+\begin{enumerate}
+    \item See Weaknesses.
+    \response
+\end{enumerate}
+
+%---------------------------------------------------------------------
+\subsection{Reviewer 3}
+\label{sec:r3}
+
+\subsubsection*{Scores}
+\begin{itemize}[nosep]
+    \item \score{Quality}{3 (good)}
+    \item \score{Clarity}{3 (good)}
+    \item \score{Significance}{3 (good)}
+    \item \score{Originality}{3 (good)}
+    \item \score{Rating}{4 --- Borderline accept: Technically solid paper where reasons to accept outweigh reasons to reject, e.g., limited evaluation. Please use sparingly.}
+    \item \score{Confidence}{3 --- You are fairly confident in your assessment. It is possible that you did not understand some parts of the submission or that you are unfamiliar with some pieces of related work. Math/other details were not carefully checked.}
+\end{itemize}
+
+\subsubsection*{Weaknesses}
+\begin{enumerate}
+    \item A small estimated KL divergence on a narrow reference set does not imply that other capabilities or safety properties are preserved. The term ``safe'' therefore appears stronger than what the method establishes.
+    \response
+    \item The paper does not quantify how accurately the predicted quadratic drift corresponds to the drift after the complete training trajectory.
+    \response
+    \item The real-data experiments report downstream benchmark changes, but do not systematically compare predicted Fisher cost with realized KL divergence or downstream behavioral degradation across subsets. Such a correlation analysis is important to validate the central modeling assumption.
+    \response
+    \item All real experiments use one 7B OLMo-2 model family and LoRA adaptation. It is unclear whether the conclusions transfer to other architectures, larger models, full-parameter fine-tuning, or preference/RL-based adaptation.
+    \response
+    \item Per-example gradient extraction and low-rank basis construction can be expensive. The paper reports the hardware but does not provide end-to-end runtime, memory consumption, preprocessing cost, or scaling comparisons against the baselines.
+    \response
+\end{enumerate}
+
+\subsubsection*{Questions}
+\begin{enumerate}
+    \item See above.
+    \response
+\end{enumerate}
+
+\subsubsection*{Limitations}
+\begin{enumerate}
+    \item Yes.
+    \response
+\end{enumerate}
+
+\end{document}

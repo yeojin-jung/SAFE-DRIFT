@@ -1,0 +1,131 @@
+\documentclass{article}
+\usepackage[landscape,margin=0.7in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.25}
+
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\title{SAFE-DRIFT Rebuttal: Experiment Section Plan}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{Compute currency:} complexity is reported in \textbf{FLOPs} (hardware-independent), with peak GPU memory as a secondary axis.\\
+\textbf{Reviewer tags:} \textbf{AC-1}~compute/complexity, \textbf{AC-2}~predicted-vs-realized drift, \textbf{AC-3}~reference coverage / ``safe'' over-claim, \textbf{AC-4}~forgetting baselines, \textbf{AC-5}~other architectures. \textbf{R$n$-*} = reviewer $n$ weakness/question.
+
+\vspace{1em}
+\section*{Main Paper}
+
+\footnotesize
+\begin{tabular}{@{}cP{1.05in}P{0.45in}P{2.0in}P{1.5in}P{1.5in}P{0.7in}P{1.2in}@{}}
+\toprule
+\# & \textbf{Deliverable} & \textbf{T/F} & \textbf{What to show} & \textbf{Metrics} & \textbf{Question (tags)} & \textbf{Setting} & \textbf{New work?} \\
+\midrule
+
+M1 & Settings summary & Table &
+Candidate / target / reference, base model, LoRA $(r,\alpha)$, $(K_R,K_T)$, $\rho$, $\epsilon$, entanglement $\rho_E$ &
+Config fields + scalar $\rho_E$ per (target, reference) pair &
+Context: ``what are the four regimes'' &
+All 4 &
+Have it \\
+
+M2 & Main results & Table + small Pareto scatter &
+Per method: target performance, realized reference drift, compute; forgetting baselines as extra rows. Scatter = target vs drift &
+Target metric (pass@$k$ / acc / ESConv), reference KL or $\Delta$ICAT, total FLOPs &
+Match target at least drift, compute-competitive (R2-W1, AC-4, AC-1) &
+All 4 &
+Target+drift recorded; \textbf{+forgetting runs}, \textbf{+FLOPs hook} \\
+
+M3 & Model / scale ablation (+ model-size compute scaling) & Table &
+Metrics across Qwen, OLMo-13B, Mistral (+ base OLMo-7B); FLOPs \& peak-mem columns &
+Target, drift, FLOPs, peak GPU mem &
+Transfers across family \& scale; scaling in model size (AC-5, R3-W4, AC-1) &
+Setting 2 (acc measurable on small models) &
+\textbf{New runs}; +mem logging \\
+
+M4 & Spectral energy + entanglement + rank ablation & Figure &
+Cumulative energy of $F_R$ vs $K_R$ and residual target energy vs $K_T$ (should saturate); metric-vs-rank overlay; inset: $g_T$ split R-block vs T-block &
+$F_R$ eigenvalue spectrum, residual singular values, $\rho_E$, target/drift vs rank &
+Truncation not lossy; entanglement shows when drift control matters (R1-W2, R2-W4) &
+Setting 1 &
+\textbf{+spectrum logging}; entanglement in JSON \\
+
+M5 & Estimated vs realized (subsumes $\rho$ knob) & Figure (2 scatters + twin-axis) &
+Predicted ref cost vs realized drift; predicted gain vs realized target $\Delta$; target \& drift vs $\rho$; report correlation &
+\texttt{safe\_reference\_cost}, \texttt{safe\_predicted\_target\_gain} vs realized KL/$\Delta$ICAT \& target $\Delta$ &
+Model predictive over real training (AC-2, R3-W2, R3-W3) &
+Setting 3 &
+Predicted+realized recorded; trajectory panel needs per-checkpoint drift \\
+
+\bottomrule
+\end{tabular}
+
+\normalsize
+\vspace{2em}
+\section*{Appendix}
+
+\footnotesize
+\begin{tabular}{@{}cP{1.05in}P{0.45in}P{2.0in}P{1.5in}P{1.5in}P{0.7in}P{1.2in}@{}}
+\toprule
+\# & \textbf{Deliverable} & \textbf{T/F} & \textbf{What to show} & \textbf{Metrics} & \textbf{Question (tags)} & \textbf{Setting} & \textbf{New work?} \\
+\midrule
+
+A1 & Forgetting-baseline comparison (extended) & Table &
+Full set of forgetting / safety-drift baselines (EWC, replay, KL-reg FT, LESS/DSIR + wrapper) &
+Target, drift, FLOPs &
+Baseline comprehensiveness (AC-4, R1-Q4, R2-W2) &
+Setting 1 (+2) &
+\textbf{New runs} \\
+
+A2 & Preconditioner ablation (Adam vs SGD) & Figure grid + Table &
+Geometry plots across $\rho$; target/drift per optimizer &
+Residual cosine, reference cost, $\rho_E$ (color), target, drift &
+Robust to optimizer; geometry interpretation (R1-W1) &
+Settings 2, 3 &
+Mostly have \\
+
+A3 & Compute / FLOPs scaling & Table + Figure &
+Per-stage FLOPs \& peak memory vs candidate-pool size and vs baselines &
+Stage FLOPs (grad extraction, low-rank build, selection, training), peak mem; vs LESS/DSIR &
+End-to-end cost \& scaling with data size (AC-1, R1-Q1, R3-W5, R2-W4) &
+Setting 2 (extend pool $\to$ 50K) &
+\textbf{Pool-size sweep}; FLOPs+mem hooks \\
+
+A4 & Same-compute value (FLOPs-matched) & Table &
+SAFE-DRIFT (select small pool + train) vs train on larger unselected pool, at equal FLOPs &
+Target, drift at matched FLOPs budget &
+Realistic gain per compute (R1-Q3) &
+Setting 1 or 2 &
+\textbf{New runs} (reuse M2 + one more) \\
+
+A5 & Reference coverage / ``safe'' & Table/Fig (cross-ref) &
+In-reference vs out-of-reference drift; effect of mixing several reference sets &
+Reference KL vs held-out capability drift; single vs mixed references &
+Reference coverage; softens ``safe'' over-claim (AC-3, R2-W3, R3-W1) &
+Colleague's setup &
+\textbf{Handled by colleague's mixture-of-references experiment} — cross-reference \\
+
+A6 & Target-gradient-as-mean robustness (optional) & Table/Fig &
+Sample-mean vs trimmed/robust target gradient under injected outliers &
+Target $\Delta$, selection stability &
+Robustness of mean target gradient (R1-W3) &
+Setting 1 &
+Small ablation (optional) \\
+
+A7 & Full-parameter FT (stretch) & Table &
+One full-FT run vs LoRA &
+Target, drift &
+Beyond LoRA (R3-W4) &
+Setting 1 &
+Optional run \\
+
+\bottomrule
+\end{tabular}
+
+\end{document}
