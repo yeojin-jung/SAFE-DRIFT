@@ -39,6 +39,18 @@ from evaluation.entanglement_analysis import (
     headline_metrics as entanglement_headline_metrics,
     selected_indices_from_records,
 )
+from utils.compute_profile import (
+    GRADIENT_PASS_COUNTER,
+    describe_model,
+    dense_matmul_flops,
+    empty_stage,
+    gradient_extraction_flops,
+    process_peak_memory,
+    profile_stage,
+    summarize_stages,
+    symmetric_eigh_flops,
+    thin_svd_flops,
+)
 from utils.extract_gradients import (
     compute_projected_feature,
     compute_projected_reference_fisher,
@@ -510,6 +522,7 @@ def build_selector_preconditioner(
             "selector_preconditioner": "sgd",
             "preconditioner_wallclock_seconds": 0.0,
             "adam_warmup_steps_resolved": None,
+            "compute_preconditioner": empty_stage("preconditioner", reason="sgd_preconditioner_is_identity"),
         }
     if args.selector_preconditioner != "adam":
         raise ValueError(f"Unsupported selector preconditioner: {args.selector_preconditioner}")
@@ -534,20 +547,34 @@ def build_selector_preconditioner(
             "preconditioner_cache_path": str(cache_path),
             "preconditioner_wallclock_seconds": 0.0,
             "adam_warmup_steps_resolved": warmup_steps,
+            "compute_preconditioner": empty_stage("preconditioner", reason="preconditioner_cache_hit"),
+            # Cost this stage would have incurred had the cache been cold, kept so
+            # amortized-vs-cold compute can be reported from the manifest alone.
+            "compute_preconditioner_cold_build": metadata.get("compute_preconditioner"),
         }
 
+    model_shape = describe_model(model, model_name=args.model_name)
+    stage_out: dict[str, Any] = {}
     start = time.perf_counter()
-    v_bar = estimate_adam_second_moment(
-        model=model,
-        tokenizer=tokenizer,
-        warmup_data=warmup_data,
-        beta2=args.adam_beta2,
-        n_steps=warmup_steps,
-        device=device,
-        max_seq_len=args.max_seq_len,
-        use_lora=True,
-    )
-    preconditioner = build_adam_preconditioner(v_bar, eps=args.adam_eps, eta=1.0).cpu()
+    with profile_stage("preconditioner", stage_out, device=device):
+        v_bar = estimate_adam_second_moment(
+            model=model,
+            tokenizer=tokenizer,
+            warmup_data=warmup_data,
+            beta2=args.adam_beta2,
+            n_steps=warmup_steps,
+            device=device,
+            max_seq_len=args.max_seq_len,
+            use_lora=True,
+        )
+        preconditioner = build_adam_preconditioner(v_bar, eps=args.adam_eps, eta=1.0).cpu()
+    # The warmup issues `warmup_steps` LoRA forward/backward passes; token counts
+    # come from the global gradient counter delta recorded by profile_stage.
+    stage_record = stage_out["compute_preconditioner"]
+    stage_flops = gradient_extraction_flops(model_shape, stage_record["model_passes"], use_lora=True)
+    stage_record["flops"] = stage_flops["total_flops"]
+    stage_record["flops_detail"] = {"adam_warmup_forward_backward": stage_flops}
+    stage_record["model_shape"] = model_shape.as_dict()
     elapsed = time.perf_counter() - start
     metadata = {
         "selector_preconditioner": "adam",
@@ -555,6 +582,7 @@ def build_selector_preconditioner(
         "preconditioner_cache_path": str(cache_path),
         "preconditioner_wallclock_seconds": elapsed,
         "adam_warmup_steps_resolved": warmup_steps,
+        "compute_preconditioner": stage_record,
         "adam_warmup_pool_size": len(warmup_data),
         "adam_beta2": args.adam_beta2,
         "adam_eps": args.adam_eps,
@@ -834,6 +862,12 @@ def compute_low_rank_selector_features(
         "low_rank_candidate_max_examples": args.low_rank_candidate_max_examples,
         "low_rank_basis_candidate_count": low_rank_processed_candidate_count,
         "low_rank_projection_candidate_count": len(candidates),
+        "reference_fisher_examples": min(len(references), int(args.reference_fisher_max_examples)),
+        "low_rank_target_examples": (
+            len(targets)
+            if args.low_rank_target_max_examples is None
+            else min(len(targets), int(args.low_rank_target_max_examples))
+        ),
         "low_rank_resolved_rank": safe_inputs.common_basis.K,
         "low_rank_resolved_reference_rank": safe_inputs.reference_low_rank.K_R,
         "low_rank_reference_shrinkage_gamma": safe_inputs.reference_low_rank.shrinkage_gamma,
@@ -866,6 +900,87 @@ def compute_low_rank_selector_features(
     )
 
 
+def annotate_feature_build_flops(
+    *,
+    stage: dict[str, Any],
+    model_shape,
+    feature_info: dict[str, Any],
+    candidate_features: torch.Tensor,
+    reference_fisher: torch.Tensor | None,
+    d_lora: int | None,
+) -> None:
+    """Attach a FLOPs estimate to the feature-build stage record.
+
+    Two contributions are counted. The per-example gradient extraction is the
+    dominant one and is derived from the pass/token counters. The low-rank
+    algebra is counted exactly from the shapes the builder actually uses
+    (dual-Gram eigendecompositions plus basis formation and projection), and is
+    typically ~1e-3 of the extraction cost.
+    """
+    stage["model_shape"] = model_shape.as_dict()
+
+    extraction = gradient_extraction_flops(model_shape, stage["model_passes"], use_lora=True)
+    detail: dict[str, Any] = {"gradient_extraction": extraction}
+    total = float(extraction["total_flops"])
+
+    if d_lora and feature_info.get("selector_feature_method") == "low_rank":
+        d = float(d_lora)
+        K = float(feature_info.get("low_rank_resolved_rank") or candidate_features.shape[1])
+        K_R = float(feature_info.get("low_rank_resolved_reference_rank") or 0)
+        K_T = float(feature_info.get("low_rank_resolved_task_rank") or 0)
+        n_ref = float(feature_info.get("reference_fisher_examples") or 0)
+        n_basis = float(feature_info.get("low_rank_basis_candidate_count") or 0)
+        n_proj = float(feature_info.get("low_rank_projection_candidate_count") or candidate_features.shape[0])
+
+        algebra = 0.0
+        algebra_detail: dict[str, float] = {}
+
+        # Reference block: dual Gram S S^T / N_R, its eigendecomposition, and
+        # lifting the dual eigenvectors back to the d-dimensional basis U_R.
+        if n_ref:
+            reference = dense_matmul_flops(int(n_ref), int(n_ref), int(d))
+            reference += symmetric_eigh_flops(int(n_ref))
+            reference += dense_matmul_flops(int(d), int(K_R), int(n_ref))
+            algebra_detail["reference_low_rank"] = reference
+            algebra += reference
+
+        # Task block: residualize candidate rows against U_R, dual Gram, eigh,
+        # and lift back to U_T.
+        if n_basis and K_T:
+            task = 2.0 * dense_matmul_flops(int(n_basis), int(K_R), int(d))
+            task += dense_matmul_flops(int(n_basis), int(n_basis), int(d))
+            task += symmetric_eigh_flops(int(n_basis) + 1)
+            task += dense_matmul_flops(int(d), int(K_T), int(n_basis))
+            algebra_detail["task_candidate_low_rank"] = task
+            algebra += task
+
+        # Common basis: residualize U_T against U_R, then orthonormalize.
+        if K_R and K_T:
+            common = 2.0 * dense_matmul_flops(int(d), int(K_T), int(K_R))
+            common += thin_svd_flops(int(d), int(K_T))
+            algebra_detail["common_basis"] = common
+            algebra += common
+
+        # Projecting every candidate gradient into the K-dimensional basis.
+        projection = dense_matmul_flops(int(n_proj), int(K), int(d))
+        algebra_detail["candidate_projection"] = projection
+        algebra += projection
+
+        detail["low_rank_algebra"] = {
+            "total_flops": algebra,
+            "breakdown": algebra_detail,
+            "d_lora": int(d),
+            "K": int(K),
+            "K_R": int(K_R),
+            "K_T": int(K_T),
+        }
+        total += algebra
+
+    stage["flops"] = total
+    stage["flops_detail"] = detail
+    stage["reference_fisher_dim"] = None if reference_fisher is None else int(reference_fisher.numel())
+
+
 def compute_or_load_shared_selector_features(
     args: argparse.Namespace,
     candidates: list[dict[str, Any]],
@@ -883,6 +998,11 @@ def compute_or_load_shared_selector_features(
             "selector_feature_cache_hit": True,
             "selector_feature_cache_path": str(cache_path),
             "selector_feature_wallclock_seconds": 0.0,
+            "compute_preconditioner": empty_stage("preconditioner", reason="selector_feature_cache_hit"),
+            "compute_feature_build": empty_stage("feature_build", reason="selector_feature_cache_hit"),
+            # Cold-build cost recorded when this cache entry was first written.
+            "compute_preconditioner_cold_build": metadata.get("compute_preconditioner"),
+            "compute_feature_build_cold_build": metadata.get("compute_feature_build"),
         }
         return SharedSelectorFeatures(
             candidate_features=payload["candidate_features"],
@@ -895,32 +1015,45 @@ def compute_or_load_shared_selector_features(
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model, tokenizer = load_model_for_selection(args, device=device)
+    model_shape = describe_model(model, model_name=args.model_name)
     preconditioner, preconditioner_info = build_selector_preconditioner(args, candidates, model, tokenizer, device)
 
+    feature_stage_out: dict[str, Any] = {}
     start = time.perf_counter()
-    if args.selector_feature_method == "random_sketch":
-        target_features = None
-        candidate_features, target_feature, reference_fisher, feature_info, basis, reference_evals_full, task_evals_full = compute_random_sketch_selector_features(
-            args=args,
-            candidates=candidates,
-            targets=targets,
-            references=references,
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-        )
-    elif args.selector_feature_method == "low_rank":
-        candidate_features, target_feature, target_features, reference_fisher, feature_info, basis, reference_evals_full, task_evals_full = compute_low_rank_selector_features(
-            args=args,
-            candidates=candidates,
-            targets=targets,
-            references=references,
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-        )
-    else:
-        raise ValueError(f"Unsupported selector feature method: {args.selector_feature_method}")
+    with profile_stage("feature_build", feature_stage_out, device=device):
+        if args.selector_feature_method == "random_sketch":
+            target_features = None
+            candidate_features, target_feature, reference_fisher, feature_info, basis, reference_evals_full, task_evals_full = compute_random_sketch_selector_features(
+                args=args,
+                candidates=candidates,
+                targets=targets,
+                references=references,
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+            )
+        elif args.selector_feature_method == "low_rank":
+            candidate_features, target_feature, target_features, reference_fisher, feature_info, basis, reference_evals_full, task_evals_full = compute_low_rank_selector_features(
+                args=args,
+                candidates=candidates,
+                targets=targets,
+                references=references,
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+            )
+        else:
+            raise ValueError(f"Unsupported selector feature method: {args.selector_feature_method}")
+
+    feature_stage = feature_stage_out["compute_feature_build"]
+    annotate_feature_build_flops(
+        stage=feature_stage,
+        model_shape=model_shape,
+        feature_info=feature_info,
+        candidate_features=candidate_features,
+        reference_fisher=reference_fisher,
+        d_lora=int(model_shape.params_trainable),
+    )
 
     projected_preconditioner = save_projected_preconditioner(
         selector_feature_method=args.selector_feature_method,
@@ -939,6 +1072,8 @@ def compute_or_load_shared_selector_features(
         "selector_feature_cache_hit": False,
         "selector_feature_cache_path": str(cache_path),
         "selector_feature_wallclock_seconds": time.perf_counter() - start,
+        "compute_feature_build": feature_stage,
+        "model_shape": model_shape.as_dict(),
         "candidate_features_shape": tuple(candidate_features.shape),
         "target_feature_shape": tuple(target_feature.shape),
         "target_features_shape": None if target_features is None else tuple(target_features.shape),
@@ -1253,6 +1388,49 @@ def safe_constraint_report(
     }
 
 
+def safe_selection_flops(
+    *,
+    num_candidates: int,
+    feature_dim: int,
+    subset_budget: int,
+    shortlist_size: int,
+    preconditioner: torch.Tensor | None,
+) -> dict[str, Any]:
+    """Exact FLOP count for the SAFE selection stage.
+
+    Counted from the operations in ``select_safe_subset_from_gradients``:
+    optional preconditioner application, diagonal whitening, rank scoring, and
+    the forward-greedy sweep, whose ``i``-th iteration scores ``S - i``
+    remaining shortlist atoms.
+    """
+    n = float(num_candidates)
+    k_dim = float(feature_dim)
+    budget = float(subset_budget)
+    shortlist = float(shortlist_size)
+
+    breakdown: dict[str, float] = {}
+    if preconditioner is not None and preconditioner.ndim == 2:
+        breakdown["preconditioner_apply"] = dense_matmul_flops(int(n), int(k_dim), int(k_dim))
+    elif preconditioner is not None:
+        breakdown["preconditioner_apply"] = n * k_dim
+
+    # Whitening is a diagonal scale of the atom matrix and the target delta.
+    breakdown["whitening"] = (n + 1.0) * k_dim
+    # Rank scores: <a_j, delta> and ||a_j||^2 for every candidate.
+    breakdown["rank_scores"] = 2.0 * (2.0 * n * k_dim)
+    # Forward greedy: sum_{i<k} 2 * (S - i) * K.
+    breakdown["greedy_marginal"] = 2.0 * k_dim * (budget * shortlist - budget * (budget - 1.0) / 2.0)
+
+    return {
+        "total_flops": float(sum(breakdown.values())),
+        "breakdown": breakdown,
+        "num_candidates": int(num_candidates),
+        "feature_dim": int(feature_dim),
+        "subset_budget": int(subset_budget),
+        "shortlist_size": int(shortlist_size),
+    }
+
+
 def ensure_random_subset(
     args: argparse.Namespace,
     candidates: list[dict[str, Any]],
@@ -1260,15 +1438,24 @@ def ensure_random_subset(
 ) -> tuple[Path, dict[str, Any]]:
     output_path = subset_output_path(args, "random", subset_budget)
     if output_path.exists() and not args.overwrite_subsets:
-        return output_path, {"selector": "random", "cache_hit": True, "selection_wallclock_seconds": 0.0}
+        return output_path, {
+            "selector": "random",
+            "cache_hit": True,
+            "selection_wallclock_seconds": 0.0,
+            "compute_selection": empty_stage("selection", reason="subset_cache_hit"),
+        }
 
+    stage_out: dict[str, Any] = {}
     start = time.perf_counter()
-    indices = select_random(len(candidates), subset_budget=subset_budget, seed=args.seed)
+    with profile_stage("selection", stage_out) as stage:
+        indices = select_random(len(candidates), subset_budget=subset_budget, seed=args.seed)
+        stage.set_flops(0.0, note="random selection performs no arithmetic on features")
     write_jsonl(build_subset_records(candidates, indices), output_path)
     return output_path, {
         "selector": "random",
         "cache_hit": False,
         "selection_wallclock_seconds": time.perf_counter() - start,
+        "compute_selection": stage_out["compute_selection"],
     }
 
 
@@ -1280,27 +1467,41 @@ def ensure_dsir_subset(
 ) -> tuple[Path, dict[str, Any]]:
     output_path = subset_output_path(args, "dsir", subset_budget)
     if output_path.exists() and not args.overwrite_subsets:
-        return output_path, {"selector": "dsir", "cache_hit": True, "selection_wallclock_seconds": 0.0}
+        return output_path, {
+            "selector": "dsir",
+            "cache_hit": True,
+            "selection_wallclock_seconds": 0.0,
+            "compute_selection": empty_stage("selection", reason="subset_cache_hit"),
+        }
 
+    stage_out: dict[str, Any] = {}
     start = time.perf_counter()
-    with tempfile.TemporaryDirectory() as temp_dir:
-        candidate_path = Path(temp_dir) / "candidate.jsonl"
-        target_path = Path(temp_dir) / "target.jsonl"
-        write_instruction_jsonl(candidates, candidate_path)
-        write_instruction_jsonl(targets, target_path)
-        indices = select_dsir(
-            pool_jsonl_path=str(candidate_path),
-            target_jsonl_path=str(target_path),
-            k=subset_budget,
-            num_buckets=args.num_buckets,
-            q_sample_ratio=args.q_sample_ratio,
-            q_seed=args.seed,
-        )
+    with profile_stage("selection", stage_out) as stage:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            candidate_path = Path(temp_dir) / "candidate.jsonl"
+            target_path = Path(temp_dir) / "target.jsonl"
+            write_instruction_jsonl(candidates, candidate_path)
+            write_instruction_jsonl(targets, target_path)
+            indices = select_dsir(
+                pool_jsonl_path=str(candidate_path),
+                target_jsonl_path=str(target_path),
+                k=subset_budget,
+                num_buckets=args.num_buckets,
+                q_sample_ratio=args.q_sample_ratio,
+                q_seed=args.seed,
+            )
+        # DSIR is hashed n-gram counting plus a log-ratio scan; the work is
+        # string hashing and integer histogram updates rather than float matmuls,
+        # so a FLOP count is not the right currency. Wall-clock is the honest
+        # number here and is recorded alongside.
+        stage.flops = None
+        stage.flops_detail["note"] = "dsir cost is hashing/counting, not floating-point; see wallclock_seconds"
     write_jsonl(build_subset_records(candidates, [int(index) for index in indices]), output_path)
     return output_path, {
         "selector": "dsir",
         "cache_hit": False,
         "selection_wallclock_seconds": time.perf_counter() - start,
+        "compute_selection": stage_out["compute_selection"],
     }
 
 
@@ -1314,17 +1515,39 @@ def ensure_less_subset(
     selector_name = f"less_{args.selector_feature_method}_{args.selector_preconditioner}"
     output_path = subset_output_path(args, selector_name, subset_budget)
     if output_path.exists() and not args.overwrite_subsets:
-        return output_path, {"selector": selector_name, "cache_hit": True, "selection_wallclock_seconds": 0.0}
+        return output_path, {
+            "selector": selector_name,
+            "cache_hit": True,
+            "selection_wallclock_seconds": 0.0,
+            "compute_selection": empty_stage("selection", reason="subset_cache_hit"),
+        }
 
     features = get_shared_selector_features(args, candidates, targets, references)
+    preconditioner = selector_update_preconditioner(args, features)
+    stage_out: dict[str, Any] = {}
     start = time.perf_counter()
-    indices = select_less(
-        candidate_gradients=features.candidate_features.float(),
-        target_gradient=features.target_feature.float(),
-        subset_budget=subset_budget,
-        preconditioner=selector_update_preconditioner(args, features),
-        similarity=args.less_similarity,
-    )
+    with profile_stage("selection", stage_out) as stage:
+        indices = select_less(
+            candidate_gradients=features.candidate_features.float(),
+            target_gradient=features.target_feature.float(),
+            subset_budget=subset_budget,
+            preconditioner=preconditioner,
+            similarity=args.less_similarity,
+        )
+        num_candidates, feature_dim = features.candidate_features.shape
+        breakdown = {"similarity_scores": 2.0 * float(num_candidates) * float(feature_dim)}
+        if preconditioner is not None and preconditioner.ndim == 2:
+            breakdown["preconditioner_apply"] = dense_matmul_flops(int(num_candidates), int(feature_dim), int(feature_dim))
+        elif preconditioner is not None:
+            breakdown["preconditioner_apply"] = float(num_candidates) * float(feature_dim)
+        stage.set_flops(
+            sum(breakdown.values()),
+            less_selection={
+                "breakdown": breakdown,
+                "num_candidates": int(num_candidates),
+                "feature_dim": int(feature_dim),
+            },
+        )
     wallclock = time.perf_counter() - start
     write_jsonl(build_subset_records(candidates, indices), output_path)
     return output_path, {
@@ -1333,6 +1556,7 @@ def ensure_less_subset(
         "selection_wallclock_seconds": wallclock,
         "less_similarity": args.less_similarity,
         **features.info,
+        "compute_selection": stage_out["compute_selection"],
     }
 
 
@@ -1346,20 +1570,32 @@ def ensure_prismatic_subset(
     selector_name = f"prismatic_{args.selector_feature_method}_{args.selector_preconditioner}"
     output_path = subset_output_path(args, selector_name, subset_budget)
     if output_path.exists() and not args.overwrite_subsets:
-        return output_path, {"selector": selector_name, "cache_hit": True, "selection_wallclock_seconds": 0.0}
+        return output_path, {
+            "selector": selector_name,
+            "cache_hit": True,
+            "selection_wallclock_seconds": 0.0,
+            "compute_selection": empty_stage("selection", reason="subset_cache_hit"),
+        }
 
     features = get_shared_selector_features(args, candidates, targets, references)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    stage_out: dict[str, Any] = {}
     start = time.perf_counter()
-    indices = select_prismatic(
-        candidate_gradients=features.candidate_features.to(device).float(),
-        subset_budget=subset_budget,
-        cluster_ratio=args.cluster_ratio,
-        sparsity=args.sparsity,
-        num_iters=args.num_iters,
-        method=args.method,
-        seed=args.seed,
-    )
+    with profile_stage("selection", stage_out, device=device) as stage:
+        indices = select_prismatic(
+            candidate_gradients=features.candidate_features.to(device).float(),
+            subset_budget=subset_budget,
+            cluster_ratio=args.cluster_ratio,
+            sparsity=args.sparsity,
+            num_iters=args.num_iters,
+            method=args.method,
+            seed=args.seed,
+        )
+        # Prismatic runs an iterative clustering/submodular routine whose FLOP
+        # count depends on data-dependent convergence, so it is left unestimated
+        # rather than guessed; wall-clock and peak memory are still recorded.
+        stage.flops = None
+        stage.flops_detail["note"] = "prismatic FLOPs are data-dependent (iterative clustering); not estimated"
     wallclock = time.perf_counter() - start
     write_jsonl(build_subset_records(candidates, [int(index) for index in indices]), output_path)
     return output_path, {
@@ -1367,6 +1603,7 @@ def ensure_prismatic_subset(
         "cache_hit": False,
         "selection_wallclock_seconds": wallclock,
         **features.info,
+        "compute_selection": stage_out["compute_selection"],
     }
 
 
@@ -1392,6 +1629,12 @@ def ensure_safe_subset(
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         metadata["cache_hit"] = True
         metadata["selection_wallclock_seconds"] = 0.0
+        # Keep the cold-build cost from the cached metadata, but report this
+        # invocation's incremental cost as zero.
+        for stage_key in ("compute_preconditioner", "compute_feature_build", "compute_selection"):
+            if metadata.get(stage_key) is not None:
+                metadata[f"{stage_key}_cold_build"] = metadata[stage_key]
+            metadata[stage_key] = empty_stage(stage_key.removeprefix("compute_"), reason="subset_cache_hit")
         return output_path, metadata
     if not references:
         raise ValueError("safe selector requires reference samples from --reference-file or --reference-hf-stereoset.")
@@ -1400,23 +1643,34 @@ def ensure_safe_subset(
     if features.reference_fisher is None:
         raise ValueError("safe selector requires reference_fisher in the shared selector feature cache.")
 
+    preconditioner = selector_update_preconditioner(args, features)
+    stage_out: dict[str, Any] = {}
     start = time.perf_counter()
-    result = select_safe_subset_from_gradients(
-        candidate_gradients=features.candidate_features.float(),
-        candidates=candidates,
-        target_gradient=features.target_feature.float(),
-        fisher=features.reference_fisher.float(),
-        subset_budget=subset_budget,
-        alpha=args.safe_alpha,
-        learning_rate=args.safe_learning_rate,
-        cost_c=args.safe_cost_c,
-        epsilon=args.safe_epsilon,
-        geometry=args.safe_geometry,
-        solver=args.safe_solver,
-        shortlist_size=args.safe_shortlist_size,
-        average_by_budget=args.safe_average_by_budget,
-        preconditioner=selector_update_preconditioner(args, features),
-    )
+    with profile_stage("selection", stage_out) as stage:
+        result = select_safe_subset_from_gradients(
+            candidate_gradients=features.candidate_features.float(),
+            candidates=candidates,
+            target_gradient=features.target_feature.float(),
+            fisher=features.reference_fisher.float(),
+            subset_budget=subset_budget,
+            alpha=args.safe_alpha,
+            learning_rate=args.safe_learning_rate,
+            cost_c=args.safe_cost_c,
+            epsilon=args.safe_epsilon,
+            geometry=args.safe_geometry,
+            solver=args.safe_solver,
+            shortlist_size=args.safe_shortlist_size,
+            average_by_budget=args.safe_average_by_budget,
+            preconditioner=preconditioner,
+        )
+        selection_flops = safe_selection_flops(
+            num_candidates=int(features.candidate_features.shape[0]),
+            feature_dim=int(features.candidate_features.shape[1]),
+            subset_budget=int(subset_budget),
+            shortlist_size=int(result.shortlist_size),
+            preconditioner=preconditioner,
+        )
+        stage.set_flops(selection_flops["total_flops"], safe_selection=selection_flops)
     wallclock = time.perf_counter() - start
     if args.overwrite_subsets or not output_exists:
         write_jsonl(result.selected_candidates, output_path)
@@ -1463,6 +1717,7 @@ def ensure_safe_subset(
         "safe_selected_epsilon_budget_gap": constraint_report["selected_subset"]["epsilon_norm"]["gap"],
         "safe_constraint_report": constraint_report,
         **features.info,
+        "compute_selection": stage_out["compute_selection"],
     }
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.write_text(json.dumps(selection_info, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1881,6 +2136,75 @@ def run_training_command(command: list[str], dry_run: bool) -> tuple[float, int]
     start = time.perf_counter()
     completed = subprocess.run(command, check=False)
     return time.perf_counter() - start, int(completed.returncode)
+
+
+def read_training_compute(run_output_dir: Path) -> dict[str, Any]:
+    """Pull the training-stage compute record out of the training summary.
+
+    Training runs in a subprocess, so its peak memory and FLOPs are captured
+    inside ``train_lora_sft.py`` and written to ``summary.json``; this reads them
+    back so the manifest carries every stage in one place.
+    """
+    summary_path = Path(run_output_dir) / "summary.json"
+    if not summary_path.exists():
+        return {
+            "compute_training": empty_stage("training", reason="training summary not found"),
+            "compute_final_evaluation": empty_stage("final_evaluation", reason="training summary not found"),
+        }
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {
+            "compute_training": empty_stage("training", reason="training summary unreadable"),
+            "compute_final_evaluation": empty_stage("final_evaluation", reason="training summary unreadable"),
+        }
+    compute = summary.get("compute")
+    if not isinstance(compute, dict):
+        return {
+            "compute_training": empty_stage("training", reason="training summary predates compute logging"),
+            "compute_final_evaluation": empty_stage("final_evaluation", reason="training summary predates compute logging"),
+        }
+    return compute
+
+
+def build_run_compute_block(
+    selection_info: dict[str, Any],
+    training_compute: dict[str, Any],
+) -> dict[str, Any]:
+    """Collect the four instrumented stages for one run and summarize them."""
+    stages: dict[str, Any] = {}
+    for key in ("compute_preconditioner", "compute_feature_build", "compute_selection"):
+        payload = selection_info.get(key)
+        if isinstance(payload, dict):
+            stages[key] = payload
+    for key, payload in training_compute.items():
+        if key.startswith("compute_") and isinstance(payload, dict):
+            stages[key] = payload
+
+    cold_build = {
+        key: selection_info[key]
+        for key in (
+            "compute_preconditioner_cold_build",
+            "compute_feature_build_cold_build",
+            "compute_selection_cold_build",
+        )
+        if isinstance(selection_info.get(key), dict)
+    }
+
+    block: dict[str, Any] = dict(stages)
+    block["summary"] = summarize_stages(stages)
+    if cold_build:
+        # Stages served from cache this run; the recorded cost is what a cold
+        # run would have paid, so amortized and cold totals can both be reported.
+        block["cold_build_stages"] = cold_build
+        amortized = dict(stages)
+        for key, payload in cold_build.items():
+            amortized[key.removesuffix("_cold_build")] = payload
+        block["summary_including_cold_build"] = summarize_stages(amortized)
+    model_shape = selection_info.get("model_shape")
+    if isinstance(model_shape, dict):
+        block["model_shape"] = model_shape
+    return block
 
 
 def copy_file_unless_same(src: Path, dst: Path) -> None:
@@ -2506,9 +2830,17 @@ def main() -> None:
     }
 
     if args.prepare_shared_selector_cache_only:
-        get_shared_selector_features(args, candidates, targets, references)
+        prepared = get_shared_selector_features(args, candidates, targets, references)
         manifest["prepared_shared_selector_cache_only"] = True
         manifest["entanglement_analysis"]["results"] = collect_entanglement_analysis_results(args)
+        manifest["compute_summary"] = {
+            **process_peak_memory(),
+            "stages": {
+                key: prepared.info[key]
+                for key in ("compute_preconditioner", "compute_feature_build")
+                if isinstance(prepared.info.get(key), dict)
+            },
+        }
         manifest_path = output_dir / "selector_sft_sweep_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, ensure_ascii=False)
@@ -2531,6 +2863,7 @@ def main() -> None:
                     "selection_wallclock_seconds": 0.0,
                     "cache_hit": True,
                     "preconditioner_disjoint": bool(candidate_split_info["preconditioner_data_disjoint"]),
+                    "compute_selection": empty_stage("selection", reason="full pool needs no selection"),
                 }
                 method_tag = "full"
             else:
@@ -2587,6 +2920,8 @@ def main() -> None:
             merge_selection_artifacts_into_training_summary(run_output_dir, selection_artifacts)
             merge_entanglement_into_training_summary(run_output_dir, entanglement_info)
 
+            training_compute = read_training_compute(run_output_dir)
+
             manifest["runs"].append(
                 {
                     "selector": selector,
@@ -2601,11 +2936,31 @@ def main() -> None:
                     "train_command": command,
                     "train_wallclock_seconds": train_seconds,
                     "train_return_code": return_code,
+                    "compute": build_run_compute_block(selection_info, training_compute),
                 }
             )
 
     manifest_path = output_dir / "selector_sft_sweep_manifest.json"
     manifest["entanglement_analysis"]["results"] = collect_entanglement_analysis_results(args)
+    manifest["compute_summary"] = {
+        **process_peak_memory(),
+        "flops_convention": {
+            "transformer": "forward 2*N*T; LoRA fwd+bwd 4*N*T; full fwd+bwd 6*N*T, with N = non-embedding "
+            "parameters and T = non-padding tokens. Unembedding and O(T^2) attention terms are added "
+            "separately rather than folded into N.",
+            "linear_algebra": "exact 2mnk matmul counts; ~9n^3 symmetric eigendecomposition; ~6mn^2+20n^3 thin SVD",
+            "note": "analytic estimates, not profiler-measured; see src/utils/compute_profile.py",
+        },
+        "per_run": [
+            {
+                "method_tag": run["method_tag"],
+                "subset_percentage": run["subset_percentage"],
+                **run["compute"]["summary"],
+            }
+            for run in manifest["runs"]
+            if isinstance(run.get("compute"), dict)
+        ],
+    }
     with manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, ensure_ascii=False)
 

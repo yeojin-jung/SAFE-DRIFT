@@ -6,6 +6,8 @@ from peft import LoraConfig, TaskType, get_peft_model
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .compute_profile import record_forward_backward
+
 
 def load_model_with_lora(model_name, lora_r, lora_alpha, lora_dropout,
                          lora_target_modules, device):
@@ -161,6 +163,11 @@ def compute_per_example_gradient(model, tokenizer, example, device, max_seq_len,
 
     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
     outputs.loss.backward()
+
+    record_forward_backward(
+        tokens=int(attention_mask.sum().item()) if attention_mask is not None else int(input_ids.numel()),
+        padded_tokens=int(input_ids.numel()),
+    )
 
     g = _collect_grad(model, use_lora=use_lora)
     model.zero_grad()

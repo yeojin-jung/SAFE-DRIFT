@@ -27,6 +27,14 @@ if str(REPO_ROOT / "src") not in sys.path:
 
 from evaluation import get_evaluator
 from evaluation import humaneval as humaneval_evaluator
+from utils.compute_profile import (
+    causal_lm_flops,
+    describe_model,
+    process_peak_memory,
+    read_peak_memory,
+    reset_peak_memory,
+    summarize_stages,
+)
 from utils.data_construction import (
     coerce_record,
     dataset_fingerprint,
@@ -1403,6 +1411,14 @@ def main() -> None:
     theta0 = flatten_trainable_parameters(accelerator.unwrap_model(model))
     previous_theta = theta0.clone()
     completed_steps = 0
+    # Reset the CUDA high-water mark so the training loop's peak is not inflated
+    # by model loading, tokenization, or the base-model evaluation above.
+    reset_peak_memory(accelerator.device)
+    model_shape = describe_model(accelerator.unwrap_model(model), model_name=args.model_name)
+    train_tokens = 0
+    train_padded_tokens = 0
+    train_sequences = 0
+    train_forward_backward_passes = 0
     train_start_time = time.perf_counter()
     warmup_end_time = None
     evaluator = None if args.evaluator == "bias_disentangle" else get_evaluator(args.evaluator)
@@ -1454,6 +1470,19 @@ def main() -> None:
                 break
 
             with accelerator.accumulate(model):
+                # Count what this micro-batch actually pushes through the model.
+                # Padded tokens drive the FLOP count (the forward runs over the
+                # full padded rectangle); non-padding tokens are recorded too so
+                # padding overhead stays visible.
+                input_ids = batch["input_ids"]
+                attention_mask = batch.get("attention_mask")
+                train_padded_tokens += int(input_ids.numel())
+                train_tokens += (
+                    int(attention_mask.sum().item()) if attention_mask is not None else int(input_ids.numel())
+                )
+                train_sequences += int(input_ids.shape[0])
+                train_forward_backward_passes += 1
+
                 outputs = model(**batch)
                 loss = outputs.loss
                 accelerator.backward(loss)
@@ -1565,6 +1594,50 @@ def main() -> None:
 
     accelerator.wait_for_everyone()
     total_train_seconds = time.perf_counter() - train_start_time
+    train_peak_memory = read_peak_memory(accelerator.device)
+    mean_sequence_length = (
+        train_padded_tokens / float(train_sequences) if train_sequences else None
+    )
+    # LoRA is always attached here, so weight gradients are formed only for the
+    # adapters and the backward pass costs ~1x forward rather than ~2x. Fall back
+    # to the dense 6*N*T convention if that ever stops being true.
+    lora_backward = model_shape.params_trainable < 0.5 * model_shape.params_total
+    train_flops = causal_lm_flops(
+        model_shape,
+        tokens=train_padded_tokens,
+        mode="forward_backward_lora" if lora_backward else "forward_backward_full",
+        mean_sequence_length=mean_sequence_length,
+    )
+    if args.gradient_checkpointing:
+        # Activation checkpointing recomputes the forward during backward, which
+        # adds one extra forward pass worth of FLOPs.
+        recompute = train_flops["forward_flops"]
+        train_flops["gradient_checkpointing_recompute_flops"] = recompute
+        train_flops["total_flops"] += recompute
+        train_flops["convention"] += " + 2*N*T activation recompute (gradient checkpointing)"
+    compute_stages: dict[str, Any] = {
+        "compute_training": {
+            "stage": "training",
+            "wallclock_seconds": total_train_seconds,
+            "flops": train_flops["total_flops"],
+            "flops_detail": {"training_forward_backward": train_flops},
+            "model_passes": {
+                "forward_backward_passes": train_forward_backward_passes,
+                "forward_passes": 0,
+                "tokens": train_tokens,
+                "padded_tokens": train_padded_tokens,
+            },
+            "sequences": train_sequences,
+            "optimizer_steps": completed_steps,
+            "model_shape": model_shape.as_dict(),
+            **train_peak_memory,
+        }
+    }
+
+    # Final evaluation (generation + reference scoring) is measured separately so
+    # the training peak is not conflated with decoding memory.
+    reset_peak_memory(accelerator.device)
+    final_eval_start = time.perf_counter()
     final_validation_loss = None
     if validation_dataloader is not None:
         final_validation_loss = evaluate_validation_loss(model, validation_dataloader, accelerator)
@@ -1610,8 +1683,30 @@ def main() -> None:
         if reference_eval_loss is not None:
             summary["reference_test_loss"] = reference_eval_loss
             summary["reference_eval_loss"] = reference_eval_loss
+        def finalize_compute() -> None:
+            """Close out the evaluation stage and attach the compute block."""
+            compute_stages["compute_final_evaluation"] = {
+                "stage": "final_evaluation",
+                "wallclock_seconds": time.perf_counter() - final_eval_start,
+                # Held-out loss passes and sampled generation dominate here, but
+                # generated-token counts are not tracked, so no FLOPs estimate is
+                # claimed. Wall-clock and peak memory are recorded.
+                "flops": None,
+                "flops_detail": {
+                    "note": "final-eval FLOPs not estimated; decoding token counts are not tracked"
+                },
+                "model_passes": {},
+                **read_peak_memory(accelerator.device),
+            }
+            summary["compute"] = {
+                **compute_stages,
+                "summary": summarize_stages(compute_stages),
+                **process_peak_memory(),
+            }
+
         if args.skip_final_evaluation:
             summary["final_evaluation_skipped"] = True
+            finalize_compute()
             save_json(summary_path, summary)
             return
         summary.update(
@@ -1643,6 +1738,7 @@ def main() -> None:
             base_key = f"{base_prefix}{metric_name}"
             if base_key in summary and isinstance(value, (int, float)) and isinstance(summary[base_key], (int, float)):
                 summary[f"{delta_prefix}{metric_name}"] = float(value) - float(summary[base_key])
+        finalize_compute()
         save_json(summary_path, summary)
 
 
