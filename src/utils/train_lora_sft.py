@@ -1414,7 +1414,7 @@ def main() -> None:
     # Reset the CUDA high-water mark so the training loop's peak is not inflated
     # by model loading, tokenization, or the base-model evaluation above.
     reset_peak_memory(accelerator.device)
-    model_shape = describe_model(accelerator.unwrap_model(model), model_name=args.model_name)
+    model_shape = describe_model(accelerator.unwrap_model(model), model_name=args.model_name_or_path)
     train_tokens = 0
     train_padded_tokens = 0
     train_sequences = 0
