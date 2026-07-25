@@ -2,6 +2,7 @@ from .dsir import select_dsir
 from .less_selector import score_less, select_less
 from .prismatic_selector import select_prismatic
 from .random_selector import select_random
+from .replay_selector import select_replay
 
 __all__ = [
     "select_dsir",
@@ -9,4 +10,5 @@ __all__ = [
     "select_less",
     "select_prismatic",
     "select_random",
+    "select_replay",
 ]
