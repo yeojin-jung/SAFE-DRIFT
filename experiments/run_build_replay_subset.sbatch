@@ -24,7 +24,11 @@ REFERENCE_HF_STEREOSET="${REFERENCE_HF_STEREOSET:-true}"
 REFERENCE_HF_SUBSET="${REFERENCE_HF_SUBSET:-intrasentence}"
 REFERENCE_HF_SPLIT="${REFERENCE_HF_SPLIT:-validation}"
 REFERENCE_HF_LABEL="${REFERENCE_HF_LABEL:-stereotype,anti-stereotype}"
-REFERENCE_HF_FORMAT="${REFERENCE_HF_FORMAT:-instruction}"
+
+# Held-out StereoSet half (disjoint from the replay pool), written out ready
+# for train_lora_sft.py's --bias-eval-data-path. Only used with
+# REFERENCE_HF_STEREOSET=true. Defaults next to OUTPUT_FILE.
+STEREOSET_EVAL_OUTPUT_FILE="${STEREOSET_EVAL_OUTPUT_FILE:-}"
 
 K="${K:-80}"
 SEED="${SEED:-42}"
@@ -50,12 +54,15 @@ CMD=(
 if [[ -n "$REFERENCE_FILE" ]]; then
     CMD+=(--reference-file "$REFERENCE_FILE")
 elif [[ "$REFERENCE_HF_STEREOSET" == "true" ]]; then
+    if [[ -z "$STEREOSET_EVAL_OUTPUT_FILE" ]]; then
+        STEREOSET_EVAL_OUTPUT_FILE="${OUTPUT_FILE%.jsonl}_stereoset_eval.json"
+    fi
     CMD+=(
         --reference-hf-stereoset
         --reference-hf-subset "$REFERENCE_HF_SUBSET"
         --reference-hf-split "$REFERENCE_HF_SPLIT"
         --reference-hf-label "$REFERENCE_HF_LABEL"
-        --reference-hf-format "$REFERENCE_HF_FORMAT"
+        --stereoset-eval-output-file "$STEREOSET_EVAL_OUTPUT_FILE"
     )
 else
     echo "Set REFERENCE_FILE or leave REFERENCE_HF_STEREOSET=true." >&2
@@ -76,6 +83,7 @@ if [[ -n "$REFERENCE_FILE" ]]; then
     echo "reference:   $REFERENCE_FILE"
 else
     echo "reference:   hf stereoset $REFERENCE_HF_SUBSET/$REFERENCE_HF_SPLIT label=$REFERENCE_HF_LABEL"
+    echo "stereoset eval output: $STEREOSET_EVAL_OUTPUT_FILE"
 fi
 
 "${CMD[@]}"
