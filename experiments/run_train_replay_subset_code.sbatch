@@ -70,6 +70,21 @@ HUMANEVAL_PASS_AT_KS="${HUMANEVAL_PASS_AT_KS:-1}"
 HUMANEVAL_TEMPERATURE="${HUMANEVAL_TEMPERATURE:-0.8}"
 HUMANEVAL_TOP_P="${HUMANEVAL_TOP_P:-0.95}"
 
+# StereoSet bias-disentanglement eval (SS/LMS/ICAT, base vs fine-tuned, computed
+# inline right after training on the just-saved adapter -- no separate array job
+# needed). Point BIAS_EVAL_DATA_PATH at the --stereoset-eval-output-file written
+# by build_replay_subset.py (the held-out half, disjoint from what training used).
+# Leave BIAS_EVAL_DATA_PATH empty to skip bias eval entirely.
+BIAS_EVAL_DATA_PATH="${BIAS_EVAL_DATA_PATH:-}"
+BIAS_DOMAIN="${BIAS_DOMAIN:-all}"
+BIAS_LAYERS="${BIAS_LAYERS:--1}"
+BIAS_ALPHA="${BIAS_ALPHA:-0.5}"
+BIAS_GEOMETRY="${BIAS_GEOMETRY:-sand-e}"
+BIAS_DIRECTION_SPLIT="${BIAS_DIRECTION_SPLIT:-0.5}"
+BIAS_BATCH_SIZE="${BIAS_BATCH_SIZE:-1}"
+BIAS_MAX_LENGTH="${BIAS_MAX_LENGTH:-512}"
+BIAS_MAX_EXAMPLES="${BIAS_MAX_EXAMPLES:-}"
+
 mkdir -p "${CLEAN_EXPERIMENTS_DIR}/logs" "${OUTPUT_ROOT}" "${TRAIN_CACHE_DIR}"
 
 cd "${MAIN_PROJECT_DIR}"
@@ -94,6 +109,11 @@ echo "run_tag:     ${RUN_TAG}"
 echo "output root: ${OUTPUT_ROOT}"
 echo "model:       ${MODEL_NAME}"
 echo "lora:        r=${TRAIN_LORA_R}, alpha=${TRAIN_LORA_ALPHA}, modules=${TRAIN_LORA_TARGET_MODULES}"
+if [[ -n "${BIAS_EVAL_DATA_PATH}" ]]; then
+    echo "bias eval:   ${BIAS_EVAL_DATA_PATH} (domain=${BIAS_DOMAIN}, layers=${BIAS_LAYERS})"
+else
+    echo "bias eval:   skipped (BIAS_EVAL_DATA_PATH not set)"
+fi
 nvidia-smi || true
 
 CMD=(
@@ -147,6 +167,21 @@ else
 fi
 if [[ -n "${EVAL_MAX_EXAMPLES}" ]]; then
     CMD+=(--eval-max-examples "${EVAL_MAX_EXAMPLES}")
+fi
+if [[ -n "${BIAS_EVAL_DATA_PATH}" ]]; then
+    CMD+=(
+        --bias-eval-data-path "${BIAS_EVAL_DATA_PATH}"
+        --bias-eval-domain "${BIAS_DOMAIN}"
+        --bias-eval-layers "${BIAS_LAYERS}"
+        --bias-eval-alpha "${BIAS_ALPHA}"
+        --bias-eval-geometry "${BIAS_GEOMETRY}"
+        --bias-eval-direction-split "${BIAS_DIRECTION_SPLIT}"
+        --bias-eval-batch-size "${BIAS_BATCH_SIZE}"
+        --bias-eval-max-length "${BIAS_MAX_LENGTH}"
+    )
+    if [[ -n "${BIAS_MAX_EXAMPLES}" ]]; then
+        CMD+=(--bias-eval-max-examples "${BIAS_MAX_EXAMPLES}")
+    fi
 fi
 
 "${CMD[@]}"
