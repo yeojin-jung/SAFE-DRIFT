@@ -1,0 +1,10 @@
+seed,safe_epsilon_multiplier,safe_cost_gamma,reference_compositions,unique_accuracy,unique_reference_degradation,unique_mean_reference_kl,unique_rho,unique_selection_method,composition_collision_detected
+42,0.5,0.01,4,1,1,1,1,1,True
+42,0.5,0.1,4,1,1,1,1,1,True
+42,0.5,1.0,4,1,1,1,1,1,True
+42,1.0,0.01,4,1,1,1,1,1,True
+42,1.0,0.1,4,1,1,1,1,1,True
+42,1.0,1.0,4,1,1,1,1,1,True
+42,2.0,0.01,4,1,1,1,1,1,True
+42,2.0,0.1,4,1,1,1,1,1,True
+42,2.0,1.0,4,1,1,1,1,1,True

@@ -1,0 +1,17 @@
+"solver_configuration","reference_composition","panel","x_metric","y_metric","n","estimate","p_value"
+"train=adamw | greedy_marginal | preconditioner=sgd","B_T","KL vs Fisher","trained_lora_fisher_cost","mean_reference_kl",27,-0.177045177045177,0.377003478813081
+"train=adamw | greedy_marginal | preconditioner=sgd","B_T","Accuracy vs rho","safe_rho","target_medqa_accuracy",27,0.185356644841708,0.354642006469009
+"train=adamw | greedy_marginal | preconditioner=sgd","B_T","Reference drift vs rho","safe_rho","reference_performance_degradation",27,-0.158128466648054,0.430840020457962
+"train=adamw | greedy_marginal | preconditioner=sgd","B_T","Accuracy vs reference drift","reference_performance_degradation","target_medqa_accuracy",27,0.122179759722813,0.543781075152016
+"train=adamw | greedy_marginal | preconditioner=sgd","B_K","KL vs Fisher","trained_lora_fisher_cost","mean_reference_kl",27,-0.0818070818070818,0.685000632366267
+"train=adamw | greedy_marginal | preconditioner=sgd","B_K","Accuracy vs rho","safe_rho","target_medqa_accuracy",27,0.204563911578085,0.306060541483193
+"train=adamw | greedy_marginal | preconditioner=sgd","B_K","Reference drift vs rho","safe_rho","reference_performance_degradation",27,-0.238372807261736,0.231163759302216
+"train=adamw | greedy_marginal | preconditioner=sgd","B_K","Accuracy vs reference drift","reference_performance_degradation","target_medqa_accuracy",27,0.0666155223041968,0.741300010499593
+"train=adamw | greedy_marginal | preconditioner=sgd","T_K","KL vs Fisher","trained_lora_fisher_cost","mean_reference_kl",27,-0.228937728937729,0.250703961341854
+"train=adamw | greedy_marginal | preconditioner=sgd","T_K","Accuracy vs rho","safe_rho","target_medqa_accuracy",27,0.269708778782948,0.17367080916958
+"train=adamw | greedy_marginal | preconditioner=sgd","T_K","Reference drift vs rho","safe_rho","reference_performance_degradation",27,-0.202202971991915,0.311797300037739
+"train=adamw | greedy_marginal | preconditioner=sgd","T_K","Accuracy vs reference drift","reference_performance_degradation","target_medqa_accuracy",27,0.0420309987104272,0.83510656734088
+"train=adamw | greedy_marginal | preconditioner=sgd","B_T_K","KL vs Fisher","trained_lora_fisher_cost","mean_reference_kl",27,-0.213064713064713,0.285952767592347
+"train=adamw | greedy_marginal | preconditioner=sgd","B_T_K","Accuracy vs rho","safe_rho","target_medqa_accuracy",27,0.269708778782948,0.17367080916958
+"train=adamw | greedy_marginal | preconditioner=sgd","B_T_K","Reference drift vs rho","safe_rho","reference_performance_degradation",27,-0.202202971991915,0.311797300037739
+"train=adamw | greedy_marginal | preconditioner=sgd","B_T_K","Accuracy vs reference drift","reference_performance_degradation","target_medqa_accuracy",27,0.0420309987104272,0.83510656734088

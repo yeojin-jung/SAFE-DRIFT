@@ -1,0 +1,40 @@
+{
+  "completed_summary_count": 341,
+  "full_sft_dispatch": {
+    "failed": 2,
+    "status_records": 7,
+    "successful": 5,
+    "total_runs": 81
+  },
+  "model_ablation_state_started": false,
+  "sgd_dispatch": {
+    "failed": 0,
+    "status_records": 5,
+    "successful": 5,
+    "total_runs": 235
+  },
+  "sgd_pause_marker_present": true,
+  "snapshot_utc": "2026-07-28T15:45:00Z",
+  "sweeps": {
+    "setting_2_medqa_medmcqa_full_sft_solver_sweep_v1": {
+      "bytes": 12295575,
+      "files": 136
+    },
+    "setting_2_medqa_medmcqa_safe_full_grid_v1": {
+      "bytes": 172388884,
+      "files": 29
+    },
+    "setting_2_medqa_medmcqa_selector_trajectory_sweep_sgd_v1": {
+      "bytes": 875097193,
+      "files": 174
+    },
+    "setting_2_medqa_medmcqa_selector_trajectory_sweep_v2": {
+      "bytes": 2645288,
+      "files": 1
+    },
+    "setting_2_medqa_medmcqa_selector_trajectory_sweep_v3": {
+      "bytes": 56934953111,
+      "files": 9231
+    }
+  }
+}
